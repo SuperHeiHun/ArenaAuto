@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest>=7.4.0
+pyinstaller>=6.0.0
+# Optional OCR fallbacks:
+# pytesseract>=0.3.10
+# easyocr>=1.7.0

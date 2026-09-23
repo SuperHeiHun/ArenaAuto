@@ -1,0 +1,281 @@
+version: 2
+adb:
+  executable: adb
+  serial: AKMP9K2217902880
+  reconnect_attempts: 3
+  command_timeout: 15.0
+automation:
+  power_threshold: 2000000
+  click_delay: 0.3
+  poll_interval: 5.0
+  dry_run: false
+recognition:
+  stable_reads: 2
+  retry_count: 3
+ocr:
+  provider: easyocr
+  scale: 3
+  threshold: true
+  whitelist: 0123456789,
+  lang: ch
+  dpi: 300
+  device: auto
+  timeout_ms: 1500
+  cache_enabled: true
+  cache_difference_threshold: 3.0
+  power_allowlist: 0123456789,.
+  challenge_allowlist: 0123456789/
+  cache:
+    enabled: true
+    difference_threshold: 3.0
+  stability:
+    enabled: true
+    max_attempts: 3
+logging:
+  performance: false
+battle:
+  poll_interval: 5.0
+  max_duration: 300.0
+purchase:
+  enabled: true
+  auto_confirm: true
+  max_per_session: 10
+  buy_button:
+    region:
+    - 1067
+    - 741
+    - 110
+    - 75
+    click:
+    - 1122
+    - 778
+    confidence: 1.0
+    source: calibrated
+  confirm_button:
+    region:
+    - 0
+    - 0
+    - 0
+    - 0
+    click:
+    - 0
+    - 0
+    confidence: 0.0
+    source: default
+recovery:
+  allow_back: true
+  max_attempts: 3
+debug:
+  enabled: true
+  save_screenshots: true
+  save_failed_recognition: true
+  directory: debug
+  allow_ocr_fallback: false
+  ocr_fallback_min_failures: 3
+timeouts:
+  detect_screen: 10.0
+  prepare: 15.0
+  start_battle: 10.0
+  result: 300.0
+  purchase: 15.0
+  recovery: 30.0
+screen:
+  reference_width: 1920
+  reference_height: 1080
+calibration:
+  power_region_padding:
+    x: 20
+    y: 20
+  template_padding:
+    x: 20
+    y: 15
+  weights:
+    numeric: 0.3
+    position: 0.25
+    spacing: 0.2
+    structure: 0.15
+    ocr: 0.1
+  min_power_digits: 5
+  max_power_digits: 10
+  min_ocr_confidence: 0.3
+  x_tolerance: 80
+  spacing_min: 40
+  spacing_max: 400
+  slot_match_tolerance: 40
+  card_extend_left: 400
+  high_confidence: 0.9
+  low_confidence: 0.75
+  generate_templates: true
+  debug_overlays: true
+opponents:
+- id: 1
+  power_region:
+  - 1614
+  - 202
+  - 196
+  - 72
+  click:
+  - 1493
+  - 242
+  source: manual
+  confidence: 1.0
+- id: 2
+  power_region:
+  - 1614
+  - 458
+  - 190
+  - 80
+  click:
+  - 1493
+  - 494
+  source: manual
+  confidence: 1.0
+- id: 3
+  power_region:
+  - 1614
+  - 710
+  - 187
+  - 78
+  click:
+  - 1493
+  - 746
+  source: manual
+  confidence: 1.0
+- id: 4
+  power_region:
+  - 1614
+  - 964
+  - 178
+  - 80
+  click:
+  - 1493
+  - 990
+  source: manual
+  confidence: 1.0
+- id: 5
+  power_region:
+  - 0
+  - 0
+  - 100
+  - 50
+  click:
+  - 0
+  - 0
+  source: default
+  confidence: 0.0
+challenge_region:
+- 510
+- 562
+- 134
+- 84
+buttons:
+  buy_challenge:
+    region:
+    - 1067
+    - 741
+    - 110
+    - 75
+    click:
+    - 1122
+    - 778
+    confidence: 1.0
+    source: calibrated
+  exit:
+    region:
+    - 1278
+    - 957
+    - 103
+    - 75
+    click:
+    - 1330
+    - 994
+    confidence: 0.9331118324572389
+    source: calibrated
+  go_win:
+    region:
+    - 1573
+    - 954
+    - 132
+    - 75
+    click:
+    - 1639
+    - 992
+    confidence: 1.0
+    source: calibrated
+result:
+  victory:
+    region:
+    - 0
+    - 0
+    - 0
+    - 0
+    click:
+    - 0
+    - 0
+    confidence: 0.0
+    source: default
+  defeat:
+    region:
+    - 0
+    - 0
+    - 0
+    - 0
+    click:
+    - 0
+    - 0
+    confidence: 0.0
+    source: default
+  exit:
+    region:
+    - 1278
+    - 957
+    - 103
+    - 75
+    click:
+    - 1330
+    - 994
+    confidence: 0.9331118324572389
+    source: calibrated
+templates:
+  go_win:
+    path: resources/templates/generated/go_win.png
+    threshold: 0.82
+  exit:
+    path: resources/templates/generated/exit.png
+    threshold: 0.82
+  buy_challenge:
+    path: resources/templates/generated/buy_challenge.png
+    threshold: 0.82
+  confirm_buy:
+    path: resources/templates/confirm_buy.png
+    threshold: 0.82
+  victory:
+    path: resources/templates/victory.png
+    threshold: 0.8
+  defeat:
+    path: resources/templates/defeat.png
+    threshold: 0.8
+  power2:
+    path: resources/templates/power2.png
+    threshold: 0.82
+profile:
+  display_name: 胜利者的竞技场
+  arena_title_keywords:
+  - 胜利者的竞技场
+  arena_select_keywords:
+  - 请选择对手
+  challenge_keywords:
+  - 可挑战次数
+  go_win_text: 去获胜
+  exit_text: 退出
+  victory_text: 胜利
+  defeat_text: 失败
+  buy_text: 购买挑战次数
+  confirm_text: 确认
+  min_keyword_matches: 1
+challenge_count:
+  region:
+  - 510
+  - 562
+  - 134
+  - 84
