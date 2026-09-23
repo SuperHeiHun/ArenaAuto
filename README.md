@@ -1,3 +1,5 @@
+## 项目全部由mimov2.6flash编写 bug较多介意误用
+
 # ArenaAuto
 
 基于 **ADB + OpenCV + OCR** 的《胜利者的竞技场》桌面自动化工具。
