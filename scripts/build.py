@@ -10,7 +10,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _force_utf8_stdout() -> None:
+    """CI Windows runners may use cp1252; Chinese logs must not crash print()."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main() -> int:
+    _force_utf8_stdout()
     spec = ROOT / "ArenaAuto.spec"
     if not spec.is_file():
         print(f"找不到 spec: {spec}", file=sys.stderr)
