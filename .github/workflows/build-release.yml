@@ -1,0 +1,70 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Core runtime + PyInstaller only.
+          # paddleocr/paddlepaddle/easyocr are imported lazily at OCR init;
+          # keep CI installs small and avoid flaky heavy wheels on runners.
+          pip install "PySide6>=6.5.0" "opencv-python>=4.8.0" "numpy>=1.24.0" "PyYAML>=6.0" "pyinstaller>=6.0.0" "pytest>=7.4.0"
+
+      - name: Run tests
+        shell: bash
+        run: python -m pytest tests -q --tb=short
+
+      - name: Build EXE (PyInstaller)
+        shell: bash
+        run: python scripts/build.py
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path "dist/ArenaAuto/ArenaAuto.exe")) {
+            throw "dist/ArenaAuto/ArenaAuto.exe not found"
+          }
+          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev" }
+          $zip = "ArenaAuto-$tag-windows-x64.zip"
+          Compress-Archive -Path "dist/ArenaAuto" -DestinationPath $zip -Force
+          Get-Item $zip | Format-List Name, Length
+          "ZIP_NAME=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArenaAuto-windows-x64
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
