@@ -249,12 +249,20 @@ def test_button_pages_definitions() -> None:
         pages_for_button,
     )
 
-    assert BUTTON_PAGE_ORDER == ("arena", "purchase", "victory", "defeat")
-    assert page_targets("arena") == ("go_win", "exit", "buy_challenge")
+    assert BUTTON_PAGE_ORDER == (
+        "arena",
+        "prepare",
+        "purchase",
+        "victory",
+        "defeat",
+    )
+    assert page_targets("arena") == ("buy_challenge",)
+    assert page_targets("prepare") == ("go_win",)
     assert page_targets("purchase") == ("buy_challenge", "confirm_buy")
     assert page_targets("victory") == ("victory", "exit")
     assert page_targets("defeat") == ("defeat", "exit")
-    assert pages_for_button("exit") == ("arena", "victory", "defeat")
+    assert pages_for_button("go_win") == ("prepare",)
+    assert pages_for_button("exit") == ("victory", "defeat")
     assert pages_for_button("confirm_buy") == ("purchase",)
     # every displayed button belongs to at least one page
     for name, _home in BUTTON_DISPLAY:
@@ -276,11 +284,15 @@ def test_button_detector_page_scoped_detection() -> None:
         OCRBox(text="确认", confidence=0.92, bbox=(800, 600, 120, 60)),
         OCRBox(text="胜利", confidence=0.95, bbox=(700, 300, 160, 80)),
     ]
-    # arena page: only go_win/exit/buy_challenge targets
+    # arena page: only buy_challenge (exit lives on result pages)
     arena = detector.detect(boxes, names=page_targets("arena"))
-    assert set(arena) == {"go_win", "exit"}
+    assert set(arena) == set()
     assert "confirm_buy" not in arena
     assert "victory" not in arena
+    # prepare page: go_win only
+    prepare = detector.detect(boxes, names=page_targets("prepare"))
+    assert set(prepare) == {"go_win"}
+    assert "exit" not in prepare
     # purchase page: confirm only
     purchase = detector.detect(boxes, names=page_targets("purchase"))
     assert set(purchase) == {"confirm_buy"}
@@ -319,10 +331,20 @@ def test_detect_page_buttons_merges_across_pages() -> None:
     analyzer = CalibrationAnalyzer(config, ocr)
     img = np.zeros((1080, 1920, 3), dtype=np.uint8)
 
-    r1 = analyzer.detect_page_buttons(img, "arena")
-    assert set(r1["detected"]) == {"go_win", "exit"}
-    assert r1["missing"] == ["buy_challenge"]  # not on this fake screen
+    r1 = analyzer.detect_page_buttons(img, "prepare")
+    assert set(r1["detected"]) == {"go_win"}
+    assert r1["missing"] == []  # prepare page targets only go_win
     assert r1["templates"] == {}  # 全黑截图不写模板
+
+    # arena page: buy_challenge not on this screen; exit not an arena target
+    r_arena = analyzer.detect_page_buttons(img, "arena")
+    assert set(r_arena["detected"]) == set()
+    assert r_arena["missing"] == ["buy_challenge"]
+
+    # victory page: exit + victory from result OCR
+    ocr.boxes = victory_boxes
+    r_vic = analyzer.detect_page_buttons(img, "victory")
+    assert set(r_vic["detected"]) == {"victory", "exit"}
 
     # switch to victory page OCR
     ocr.boxes = victory_boxes

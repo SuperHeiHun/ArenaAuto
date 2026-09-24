@@ -23,6 +23,12 @@ from arena_auto.models.config import AdbConfig
 logger = logging.getLogger(__name__)
 
 
+def is_wireless_target(serial: str) -> bool:
+    from arena_auto.adb.wireless import is_wireless_serial
+
+    return is_wireless_serial(serial)
+
+
 class AdbController:
     """Thin, thread-safe wrapper around an adb executable."""
 
@@ -204,6 +210,125 @@ class AdbController:
         with self._lock:
             self._connected = False
             logger.info("ADB 断开连接: %s", self._serial or "-")
+
+    # -------------------------------------------------------------- wireless
+    def connect_wireless(
+        self,
+        endpoint: str,
+        *,
+        timeout: Optional[float] = None,
+        verify: bool = True,
+    ) -> str:
+        """`adb connect host:port` and verify shell echo when possible.
+
+        Returns the connected serial (host:port).
+        """
+        from arena_auto.adb.wireless import is_wireless_serial, parse_endpoint
+
+        ep = parse_endpoint(endpoint)
+        serial = ep.serial()
+        if not is_wireless_serial(serial):
+            raise AdbError(f"不是无线端点: {serial}")
+
+        with self._lock:
+            args = self._base_cmd() + ["connect", serial]
+            try:
+                raw = self._run(args, timeout=timeout, check=False)
+            except AdbError as exc:
+                raise AdbError(f"adb connect 失败: {exc}") from exc
+            message = (raw or "").strip()
+            lowered = message.lower()
+            # already connected / connected to ... are both OK for adb
+            failed = any(
+                token in lowered
+                for token in (
+                    "failed to connect",
+                    "unable to connect",
+                    "connection refused",
+                    "cannot connect",
+                    "no route to host",
+                )
+            )
+            if failed:
+                raise AdbError(f"无线连接失败: {message or serial}")
+
+            self._serial = serial
+            if verify:
+                try:
+                    self.shell("echo ok", timeout=timeout or 5.0)
+                    self._connected = True
+                except AdbError:
+                    # adb may report connected but device unauthorized/offline
+                    devices = self.list_devices()
+                    if serial not in devices:
+                        self._connected = False
+                        raise AdbDisconnectedError(
+                            f"无线设备 {serial} 未就绪: {message}"
+                        )
+                    self._connected = True
+            else:
+                self._connected = True
+            logger.info("无线 ADB 已连接: %s (%s)", serial, message or "ok")
+            return serial
+
+    def pair_wireless(
+        self,
+        endpoint: str,
+        pair_code: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> str:
+        """Android 11+ wireless debugging: `adb pair host:port code`."""
+        from arena_auto.adb.wireless import parse_endpoint, parse_pair_code
+
+        ep = parse_endpoint(endpoint)
+        code = parse_pair_code(pair_code)
+        serial = ep.serial()
+        with self._lock:
+            args = self._base_cmd() + ["pair", serial, code]
+            try:
+                raw = self._run(args, timeout=timeout or 15.0, check=False)
+            except AdbError as exc:
+                raise AdbError(f"adb pair 失败: {exc}") from exc
+            message = (raw or "").strip()
+            lowered = message.lower()
+            if "successfully paired" in lowered or "paired" in lowered:
+                logger.info("无线配对成功: %s", serial)
+                return serial
+            if "failed" in lowered or "error" in lowered or not message:
+                raise AdbError(f"无线配对失败: {message or '未知错误'}")
+            # some builds print success without the word paired
+            logger.info("无线配对输出: %s", message)
+            return serial
+
+    def enable_tcpip(self, port: int = 5555, *, use_current_serial: bool = True) -> str:
+        """Switch a USB-connected device to TCP mode (`adb -s USB tcpip PORT`)."""
+        with self._lock:
+            if use_current_serial and self._serial and ":" in self._serial:
+                raise AdbError("当前已是无线序列号，无法对其执行 tcpip")
+            cmd = self._base_cmd()
+            if use_current_serial and self._serial:
+                cmd.extend(["-s", self._serial])
+            cmd.extend(["tcpip", str(int(port))])
+            try:
+                raw = self._run(cmd, timeout=self._config.command_timeout, check=False)
+            except AdbError as exc:
+                raise AdbError(f"adb tcpip 失败: {exc}") from exc
+            logger.info("已启用 tcpip %s: %s", port, (raw or "").strip())
+            return str(int(port))
+
+    def disconnect_wireless(self, serial: Optional[str] = None) -> None:
+        """`adb disconnect [host:port]` — clears wireless endpoint only."""
+        with self._lock:
+            target = (serial or self._serial or "").strip()
+            if not is_wireless_target(target):
+                return
+            try:
+                self._run(self._base_cmd() + ["disconnect", target], check=False)
+            except AdbError as exc:
+                logger.debug("adb disconnect skipped: %s", exc)
+            if not serial or serial == self._serial:
+                self._connected = False
 
     def is_connected(self) -> bool:
         if not self._connected or not self._serial:

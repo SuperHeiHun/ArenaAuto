@@ -1,7 +1,7 @@
 version: 2
 adb:
   executable: adb
-  serial: AKMP9K2217902880
+  serial: 192.168.10.12:5555
   reconnect_attempts: 3
   command_timeout: 15.0
 automation:

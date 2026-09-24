@@ -144,9 +144,9 @@ class CalibrationAnalyzer:
     ) -> Dict[str, object]:
         """Detect only the buttons that belong to one guided page.
 
-        Used by wizard step 5: user walks through arena → purchase →
-        victory → defeat screens one at a time. Results merge across pages.
-        Never taps the device.
+        Used by wizard step 5: user walks through arena → prepare
+        (去获胜) → purchase → victory → defeat screens one at a time.
+        Results merge across pages. Never taps the device.
         """
         from arena_auto.calibration.button_detector import page_targets
 

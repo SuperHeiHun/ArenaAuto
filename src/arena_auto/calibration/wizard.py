@@ -23,11 +23,13 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -490,6 +492,10 @@ class CalibrationWorker(QThread):
         templates: Optional[TemplateRecognizer] = None,
         bundle: Optional[CalibrationBundle] = None,
         page: str = "",
+        wireless_host: str = "",
+        wireless_port: int = 5555,
+        pair_code: str = "",
+        pair_port: int = 0,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -500,12 +506,70 @@ class CalibrationWorker(QThread):
         self.templates = templates
         self.bundle = bundle
         self.page = page
+        self.wireless_host = wireless_host
+        self.wireless_port = int(wireless_port or 5555)
+        self.pair_code = pair_code
+        self.pair_port = int(pair_port or 0)
 
     def run(self) -> None:
         try:
             if self.task == "devices":
                 devices = self.adb.list_devices()
                 self.result_ready.emit("devices", {"devices": devices})
+                return
+
+            if self.task == "wireless_pair":
+                from arena_auto.adb.wireless import format_endpoint
+
+                endpoint = format_endpoint(self.wireless_host, self.pair_port or self.wireless_port)
+                serial = self.adb.pair_wireless(endpoint, self.pair_code)
+                self.result_ready.emit(
+                    "wireless_pair",
+                    {"serial": serial, "endpoint": endpoint},
+                )
+                return
+
+            if self.task == "wireless_connect":
+                from arena_auto.adb.wireless import format_endpoint
+
+                endpoint = format_endpoint(self.wireless_host, self.wireless_port)
+                # Optional pair first when code provided (Android 11+ flow).
+                if self.pair_code.strip():
+                    pair_ep = format_endpoint(
+                        self.wireless_host, self.pair_port or self.wireless_port
+                    )
+                    try:
+                        self.adb.pair_wireless(pair_ep, self.pair_code)
+                        self.progress.emit(f"配对成功: {pair_ep}")
+                    except Exception as exc:  # noqa: BLE001
+                        # pair may already be done — connect can still succeed
+                        self.progress.emit(f"配对跳过/失败: {exc}")
+                serial = self.adb.connect_wireless(endpoint)
+                # Auto-write IP:port into config.yaml (step1 兼容).
+                self.config_manager.save_adb_serial(serial)
+                self.adb.update_config(self.config_manager.config.adb)
+                devices = self.adb.list_devices()
+                self.result_ready.emit(
+                    "wireless_connect",
+                    {
+                        "serial": serial,
+                        "endpoint": endpoint,
+                        "devices": devices,
+                        "config_path": str(self.config_manager.path),
+                    },
+                )
+                return
+
+            if self.task == "tcpip":
+                port = self.wireless_port or 5555
+                self.adb.enable_tcpip(port, use_current_serial=True)
+                self.result_ready.emit(
+                    "tcpip",
+                    {
+                        "port": port,
+                        "hint": "请在手机 WLAN 设置中确认后，用 IP:端口 无线连接",
+                    },
+                )
                 return
 
             if self.task == "screenshot":
@@ -668,7 +732,7 @@ class CalibrationWizard(QDialog):
         layout = QVBoxLayout(widget)
         hint = QLabel(
             "自动获取 adb devices。单设备自动选择；多设备请手动选择；"
-            "未检测到设备无法继续。"
+            "未检测到设备无法继续。也可使用无线 ADB（IP:端口）连接。"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -681,10 +745,40 @@ class CalibrationWizard(QDialog):
         form.addRow("状态", self.device_status)
         layout.addWidget(box)
 
+        wireless = QGroupBox("无线 ADB（IP:端口）")
+        wform = QFormLayout(wireless)
+        self.wireless_host_edit = QLineEdit()
+        self.wireless_host_edit.setPlaceholderText("192.168.1.23 或 device.local")
+        wform.addRow("IP / 主机", self.wireless_host_edit)
+        self.wireless_port_spin = QSpinBox()
+        self.wireless_port_spin.setRange(1, 65535)
+        self.wireless_port_spin.setValue(5555)
+        wform.addRow("端口", self.wireless_port_spin)
+        self.wireless_pair_edit = QLineEdit()
+        self.wireless_pair_edit.setPlaceholderText(
+            "Android 11+ 无线调试配对码（可选，6 位）"
+        )
+        wform.addRow("配对码", self.wireless_pair_edit)
+        self.wireless_pair_port_spin = QSpinBox()
+        self.wireless_pair_port_spin.setRange(1, 65535)
+        self.wireless_pair_port_spin.setValue(0)
+        self.wireless_pair_port_spin.setSpecialValueText("自动/同端口")
+        wform.addRow("配对端口", self.wireless_pair_port_spin)
+        layout.addWidget(wireless)
+
         row = QHBoxLayout()
         self.refresh_devices_btn = QPushButton("刷新设备")
         self.refresh_devices_btn.clicked.connect(self._start_devices)
         row.addWidget(self.refresh_devices_btn)
+        self.wireless_connect_btn = QPushButton("无线连接并写入配置")
+        self.wireless_connect_btn.clicked.connect(self._start_wireless_connect)
+        row.addWidget(self.wireless_connect_btn)
+        self.wireless_pair_btn = QPushButton("仅配对")
+        self.wireless_pair_btn.clicked.connect(self._start_wireless_pair)
+        row.addWidget(self.wireless_pair_btn)
+        self.wireless_tcpip_btn = QPushButton("USB→tcpip 5555")
+        self.wireless_tcpip_btn.clicked.connect(self._start_tcpip)
+        row.addWidget(self.wireless_tcpip_btn)
         row.addStretch(1)
         layout.addLayout(row)
 
@@ -791,7 +885,7 @@ class CalibrationWizard(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         hint = QLabel(
-            "按钮按页面分步检测：先在竞技场页检测，再依次进入购买弹窗"
+            "按钮按页面分步检测：竞技场选对手 → 去获胜页 → 购买弹窗"
             "（挑战次数为 0 时点对手弹出）/ 胜利结算 / 失败结算页检测，"
             "结果会合并保存。"
         )
@@ -999,7 +1093,53 @@ class CalibrationWizard(QDialog):
         self.device_status.setText("检测中...")
         self._start_task("devices")
 
-    def _start_task(self, task: str) -> None:
+    def _start_wireless_connect(self) -> None:
+        host = self.wireless_host_edit.text().strip()
+        if not host:
+            QMessageBox.warning(self, "无线 ADB", "请填写 IP / 主机名")
+            return
+        self.device_status.setText(f"无线连接 {host}:{self.wireless_port_spin.value()} ...")
+        self._start_task(
+            "wireless_connect",
+            wireless_host=host,
+            wireless_port=int(self.wireless_port_spin.value()),
+            pair_code=self.wireless_pair_edit.text().strip(),
+            pair_port=int(self.wireless_pair_port_spin.value()),
+        )
+
+    def _start_wireless_pair(self) -> None:
+        host = self.wireless_host_edit.text().strip()
+        code = self.wireless_pair_edit.text().strip()
+        if not host or not code:
+            QMessageBox.warning(self, "无线 ADB", "配对需要 IP 与 6 位配对码")
+            return
+        self.device_status.setText("无线配对中...")
+        self._start_task(
+            "wireless_pair",
+            wireless_host=host,
+            wireless_port=int(self.wireless_port_spin.value()),
+            pair_code=code,
+            pair_port=int(self.wireless_pair_port_spin.value())
+            or int(self.wireless_port_spin.value()),
+        )
+
+    def _start_tcpip(self) -> None:
+        if not self.device_combo.currentText().strip():
+            QMessageBox.warning(self, "tcpip", "请先选择 USB 设备")
+            return
+        port = int(self.wireless_port_spin.value()) or 5555
+        self.device_status.setText(f"启用 tcpip {port} ...")
+        self._start_task("tcpip", wireless_port=port)
+
+    def _start_task(
+        self,
+        task: str,
+        *,
+        wireless_host: str = "",
+        wireless_port: int = 5555,
+        pair_code: str = "",
+        pair_port: int = 0,
+    ) -> None:
         self.status_label.setText(f"运行: {task} ...")
         page = "arena"
         if hasattr(self, "button_page_combo"):
@@ -1012,6 +1152,10 @@ class CalibrationWizard(QDialog):
             templates=self.templates,
             bundle=self.bundle,
             page=page,
+            wireless_host=wireless_host,
+            wireless_port=wireless_port,
+            pair_code=pair_code,
+            pair_port=pair_port,
             parent=self,
         )
         worker.result_ready.connect(self._on_worker_result)
@@ -1055,6 +1199,41 @@ class CalibrationWizard(QDialog):
                         f"检测到 {len(self.devices)} 台设备，请选择"
                     )
             self._refresh_next_state()
+            return
+
+        if task == "wireless_connect":
+            serial = payload.get("serial") or ""
+            cfg_path = payload.get("config_path") or ""
+            self.devices = list(payload.get("devices") or [serial])
+            self.device_combo.clear()
+            for s in self.devices:
+                self.device_combo.addItem(s)
+            # Prefer the wireless serial we just wrote into config.
+            idx = self.device_combo.findText(serial)
+            if idx >= 0:
+                self.device_combo.setCurrentIndex(idx)
+            self.device_status.setText(f"无线已连接并写入配置: {serial}")
+            self.device_log.appendPlainText(
+                f"无线连接成功 {serial}\n已写入 adb.serial -> {cfg_path}"
+            )
+            self.status_label.setText(f"无线 ADB 已连接: {serial}")
+            # Keep in-memory config + ADB controller in sync for later steps.
+            self.config_manager.config.adb.serial = serial
+            self.adb.update_config(self.config_manager.config.adb)
+            self._refresh_next_state()
+            return
+
+        if task == "wireless_pair":
+            serial = payload.get("serial") or ""
+            self.device_status.setText(f"配对成功: {serial}（请继续无线连接）")
+            self.device_log.appendPlainText(f"配对成功: {serial}")
+            return
+
+        if task == "tcpip":
+            port = payload.get("port")
+            hint = payload.get("hint") or ""
+            self.device_status.setText(f"已执行 adb tcpip {port}")
+            self.device_log.appendPlainText(f"adb tcpip {port}\n{hint}")
             return
 
         if task == "screenshot":
@@ -1246,6 +1425,8 @@ class CalibrationWizard(QDialog):
     def _mark_pages_attempted_from_kind(self, kind: str) -> None:
         if kind == "arena":
             self.button_pages_attempted.add("arena")
+        elif kind == "prepare":
+            self.button_pages_attempted.add("prepare")
         elif kind == "purchase":
             self.button_pages_attempted.add("purchase")
         elif kind == "result" and self.bundle is not None:

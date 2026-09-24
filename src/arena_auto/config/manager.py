@@ -197,6 +197,17 @@ class ConfigManager:
         except OSError as exc:
             raise ConfigError(f"无法写入配置: {exc}") from exc
 
+    def save_adb_serial(self, serial: str) -> None:
+        """Write adb.serial into config.yaml (wireless IP:port auto-fill).
+
+        Only mutates the serial field on the in-memory config, then persists
+        the full config. Safe to call from wireless connect step.
+        """
+        serial = (serial or "").strip()
+        self.config.adb.serial = serial
+        self.save()
+        logger.info("已写入 adb.serial = %s -> %s", serial, self.path)
+
     # ---------------------------------------------------------------- convert
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> AppConfig:

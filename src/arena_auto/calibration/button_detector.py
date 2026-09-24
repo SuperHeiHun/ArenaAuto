@@ -17,19 +17,27 @@ from arena_auto.models.recognition import OCRBox
 logger = logging.getLogger(__name__)
 
 # Guided page-by-page detection: each screen only carries its own buttons.
-BUTTON_PAGE_ORDER = ("arena", "purchase", "victory", "defeat")
+BUTTON_PAGE_ORDER = ("arena", "prepare", "purchase", "victory", "defeat")
 
 BUTTON_PAGES: Dict[str, Dict[str, object]] = {
     "arena": {
-        "title": "① 竞技场选人页",
-        "targets": ("go_win", "exit", "buy_challenge"),
+        "title": "① 竞技场选对手页",
+        "targets": ("buy_challenge",),
         "hint": (
             "手机停留在竞技场（请选择对手）页面，点「检测当前页面」："
-            "去获胜 / 退出 / 购买挑战次数。"
+            "购买挑战次数。"
+        ),
+    },
+    "prepare": {
+        "title": "② 去获胜页",
+        "targets": ("go_win",),
+        "hint": (
+            "选中对手后进入带「去获胜」的准备页"
+            "（testimg/去获胜.jpg），再检测：去获胜。"
         ),
     },
     "purchase": {
-        "title": "② 购买挑战弹窗",
+        "title": "③ 购买挑战弹窗",
         "targets": ("buy_challenge", "confirm_buy"),
         "hint": (
             "挑战次数为 0 时点对手会弹出购买弹窗，弹窗出现后再检测："
@@ -37,12 +45,12 @@ BUTTON_PAGES: Dict[str, Dict[str, object]] = {
         ),
     },
     "victory": {
-        "title": "③ 胜利结算页",
+        "title": "④ 胜利结算页",
         "targets": ("victory", "exit"),
         "hint": "打完一局进入胜利结算画面后再检测：胜利 / 退出。",
     },
     "defeat": {
-        "title": "④ 失败结算页",
+        "title": "⑤ 失败结算页",
         "targets": ("defeat", "exit"),
         "hint": "进入失败结算画面后检测：失败 / 退出（可选，可跳过）。",
     },
@@ -50,8 +58,8 @@ BUTTON_PAGES: Dict[str, Dict[str, object]] = {
 
 # Unique display order: (button name, home page)
 BUTTON_DISPLAY = (
-    ("go_win", "arena"),
-    ("exit", "arena"),
+    ("go_win", "prepare"),
+    ("exit", "victory"),
     ("buy_challenge", "arena"),
     ("confirm_buy", "purchase"),
     ("victory", "victory"),
