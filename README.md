@@ -1,6 +1,6 @@
-## 项目全部由mimov2.6flash编写 bug较多介意误用
+# ArenaAuto  
 
-# ArenaAuto
+> **项目全部由mimov2.6flash编写 bug较多介意误用**  
 
 基于 **ADB + OpenCV + OCR** 的《胜利者的竞技场》桌面自动化工具。
 
@@ -50,8 +50,14 @@ adb devices
 ## 5. 开启 Android 调试
 
 1. 开发者选项 → 打开 **USB 调试**
-2. USB 连接，或无线：`adb connect <ip>:5555`
+2. USB 连接，或无线：`adb pair <ip>:<配对端口>` → `adb connect <ip>:5555`
 3. `adb devices` 显示 `device` 状态即可
+
+**无线 ADB（程序内）**：自动配置步骤 1 支持直接填 `IP:端口` / 配对码 / 配对端口：
+
+- **无线连接并写入配置**：配对（可选）→ `adb connect` → 成功后把完整序列号（如 `192.168.10.12:5555`）写入 `config.yaml` 的 `adb.serial`
+- **仅配对**：Android 11+ 无线配对码
+- **USB→tcpip 5555**：USB 设备开启 TCP 监听后再无线连接
 
 ## 6. 安装依赖
 
@@ -122,20 +128,21 @@ manual（手动修改，confidence=1.0）
 3. 按向导 7 步确认：
 
 ```text
-步骤 1：连接设备（单设备自动选中）
+步骤 1：连接设备（单设备自动选中；支持无线 IP:端口 连接并写入 adb.serial）
 步骤 2：确认竞技场页面（可手动点「我已确认」）
 步骤 3：分析对手列表（1~5 战力 ROI + 点击点 + 置信度）
 步骤 4：确认战力区域（可拖动调整）
 步骤 5：分步检测按钮（按页面依次检测，结果合并）
-        ① 竞技场页 → 去获胜/退出/购买挑战次数
-        ② 购买弹窗（点对手后自动弹出）→ 购买/确认
-        ③ 胜利结算 → 胜利/退出
-        ④ 失败结算 → 失败/退出（可选）
+        ① 竞技场选对手 → 购买挑战次数
+        ② 去获胜页（testimg/去获胜.jpg）→ 去获胜
+        ③ 购买弹窗（点对手后自动弹出）→ 购买/确认
+        ④ 胜利结算 → 胜利/退出
+        ⑤ 失败结算 → 失败/退出（可选）
 步骤 6：测试识别（重新截图校验，禁止点击）
 步骤 7：保存配置
 ```
 
-按钮列表三态：`✓ 已检出` / `○ 已检测未找到（可到其它页面重试）` / `· 未检测（需切换到对应页面）`。每页只检测该页应有的按钮，跨页结果自动合并，不会互相覆盖。
+按钮列表三态：`✓ 已检出` / `○ 已检测未找到（可到其它页面重试）` / `· 未检测（需切换到对应页面）`。每页只检测该页应有的按钮（`exit` 仅在结算页），跨页结果自动合并，不会互相覆盖。
 
 4. 置信度 ≥0.90 绿色、≥0.75 黄色、否则红色 ⚠ 并要求 `[调整]`
 5. 保存时若已存在 `config.yaml`，默认 **另存为** `config/config.calibrated.yaml`（可选覆盖/取消，不静默覆盖）
@@ -347,7 +354,7 @@ pip install pytest
 pytest tests -q
 ```
 
-覆盖：战力解析、坐标缩放、配置校验、状态机、对手选择、模板匹配与页面识别、购买流程（次数为 0 → 选对手 → 弹窗购买），以及自动标定（ROI 扩展、坐标映射、1~5 对手检测、结构推导、YAML v2 迁移、按钮检测、验证流程不点击）。
+覆盖：战力解析、坐标缩放、配置校验、状态机、对手选择、模板匹配与页面识别、购买流程（次数为 0 → 选对手 → 弹窗购买），以及自动标定（ROI 扩展、坐标映射、1~5 对手检测、结构推导、YAML v2 迁移、按钮分页检测、验证流程不点击）与无线 ADB（IP:端口解析、pair code、写入 `adb.serial`）。
 
 ## 17. 安全设计（重要）
 
@@ -376,6 +383,13 @@ pytest tests -q
 3. 配置里写 adb 绝对路径  
 4. 模拟器多开时选对 serial  
 5. 程序内置 `reconnect_attempts` 自动重连  
+
+### 无线 ADB 连不上
+
+1. 手机与电脑同一局域网，系统无线调试已打开  
+2. Android 11+ 先用系统里的**配对码 + 配对端口**点「仅配对」，再用 **IP:连接端口**（常见 5555）点「无线连接并写入配置」  
+3. 连接成功后 `adb.serial` 应为 `ip:port`；失败看 GUI/日志错误（配对码格式、端口不对、未开启无线调试）  
+4. USB 可先点「USB→tcpip 5555」再拔线重连  
 
 ### OCR 识别失败
 
@@ -433,15 +447,16 @@ ArenaAuto/
 │   ├── app.py
 │   ├── paths.py
 │   ├── adb/controller.py
+│   ├── adb/wireless.py           # 无线 IP:端口 / pair / tcpip
 │   ├── automation/{controller,state_machine,selection,states}.py
 │   ├── recognition/{ocr,template,screen,detector}.py
 │   ├── config/manager.py         # 含 ConfigMigrator v1→v2
-│   ├── calibration/              # 自动标定（新增）
-│   │   ├── wizard.py             # 7 步向导 + CalibrationCanvas
-│   │   ├── analyzer.py           # 分析编排 + 验证 + 可视化
+│   ├── calibration/              # 自动标定
+│   │   ├── wizard.py             # 7 步向导 + CalibrationCanvas + 无线连接
+│   │   ├── analyzer.py           # 分析编排 + 分页按钮检测 + 验证
 │   │   ├── screen_analyzer.py    # 页面/OCR 分析
 │   │   ├── opponent_detector.py  # 1~5 对手多特征评分检测
-│   │   ├── button_detector.py    # 按钮 OCR 关键词检测
+│   │   ├── button_detector.py    # 分页按钮 OCR（arena/prepare/…）
 │   │   ├── roi_detector.py       # 战力 ROI / 挑战次数
 │   │   ├── template_generator.py # generated/ 模板生成
 │   │   ├── coordinate_mapper.py  # 实际像素 ↔ 参考分辨率
@@ -450,7 +465,7 @@ ArenaAuto/
 │   ├── debug/recorder.py
 │   ├── models/{config,recognition,state}.py
 │   └── gui/{main_window,widgets,workers}.py
-├── tests/                        # 含 test_calibration.py
+├── tests/                        # test_calibration / test_wireless_adb 等
 └── build/
 ```
 
