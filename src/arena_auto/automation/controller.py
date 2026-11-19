@@ -36,6 +36,7 @@ from arena_auto.recognition.detector import (
     ScreenDetector,
 )
 from arena_auto.recognition.ocr import OCRProvider, create_ocr_provider
+from arena_auto.recognition.auto_targeting import AutoTargeting
 from arena_auto.recognition.screen import CoordinateScaler
 from arena_auto.recognition.template import TemplateRecognizer
 
@@ -74,6 +75,7 @@ class _RuntimeContext:
     pending_purchase: bool = False
     # WAIT_RESULT: consecutive template-only misses (for optional OCR fallback)
     wait_result_template_fails: int = 0
+    auto_selection_attempts: int = 0
 
 
 class AutomationController:
@@ -108,6 +110,7 @@ class AutomationController:
             self.ocr, self.config, self.scaler, self.debug
         )
         self.buttons = ButtonFinder(self.templates, self.ocr, self.config, self.debug)
+        self.auto_targeting = AutoTargeting(self.ocr, self.config)
 
         self.sm = StateMachine(
             initial=AutomationState.IDLE,
@@ -166,6 +169,7 @@ class AutomationController:
         self.power_reader.recognition = self.config.recognition
         self.challenge_reader.config = self.config
         self.buttons.config = self.config
+        self.auto_targeting.config = self.config
         try:
             from arena_auto.recognition.ocr_engine import set_performance_logging
 
@@ -411,11 +415,11 @@ class AutomationController:
     def _state_arena(self) -> None:
         image = self._shot()
         # 1) challenge count
-        challenge = self.challenge_reader.read(image)
+        challenge = self._read_challenge(image)
         if challenge is None:
             self.statistics.recognition_failures += 1
             self._emit_statistics()
-            self.sm.transition(AutomationState.RECOVERY)
+            self.sm.transition(AutomationState.STOPPED if self.config.automation.auto_targeting else AutomationState.RECOVERY)
             return
         self.ctx.challenge = challenge
         if self.callbacks.on_challenge:
@@ -459,14 +463,28 @@ class AutomationController:
         threshold = self.config.automation.power_threshold
         self._log("INFO", f"战力阈值：{threshold}")
 
+        automatic = self.config.automation.auto_targeting
+        if automatic and self.ctx.auto_selection_attempts >= self.config.automation.auto_targeting_max_attempts:
+            self._log("ERROR", "自动选点重复点击后仍未进入备战，安全停止")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+
         try:
-            # Short-circuit: read #1 first; stop OCR as soon as power <= threshold.
-            opponents, selected = self.power_reader.read_until_at_or_below(
-                factory,
-                threshold,
-                self.config.opponents,
-                stop_event=self.stop_event,
-            )
+            if automatic:
+                self._log("INFO", "自动选点：重新识别完整卡片并校验战力，不使用已保存坐标")
+                opponents, selected = self.auto_targeting.select(factory, threshold, self.stop_event)
+                if self.auto_targeting.last_image is not None:
+                    overlay = self.auto_targeting.draw(self.auto_targeting.last_image)
+                    self.debug.save(overlay, category="arena", tag="auto_targeting")
+                    self._emit_screenshot(overlay)
+            else:
+                # Short-circuit manual/configured mode preserves the existing path.
+                opponents, selected = self.power_reader.read_until_at_or_below(
+                    factory,
+                    threshold,
+                    self.config.opponents,
+                    stop_event=self.stop_event,
+                )
         except AdbError as exc:
             raise AdbDisconnectedError(str(exc)) from exc
         except OCRFailedError as exc:
@@ -475,7 +493,7 @@ class AutomationController:
             self._log("ERROR", str(exc))
             if self.debug.enabled and self.ctx.screenshot is not None:
                 self.debug.save(self.ctx.screenshot, category="failed", tag="ocr_power")
-            self.sm.transition(AutomationState.RECOVERY)
+            self.sm.transition(AutomationState.STOPPED if automatic else AutomationState.RECOVERY)
             return
 
         if self.stop_event.is_set():
@@ -516,7 +534,13 @@ class AutomationController:
             self._log("ERROR", f"对手 #{selected.id} 的点击坐标未配置，禁止盲点")
             self.sm.transition(AutomationState.RECOVERY)
             return
+        if automatic and not self.auto_targeting.verify_target(self._shot(), selected):
+            self._log("ERROR", "点击前截图与识别时的卡片不一致（可能已刷新），取消点击")
+            self.sm.transition(AutomationState.STOPPED)
+            return
         self._safe_tap(x, y, label=f"对手 #{selected.id}")
+        if automatic:
+            self.ctx.auto_selection_attempts += 1
         self.ctx.opponent_wait_started = time.monotonic()
         if self.ctx.pending_purchase:
             self._log("INFO", "已点击对手，等待购买弹窗")
@@ -527,11 +551,16 @@ class AutomationController:
     def shot_safe(self) -> np.ndarray:
         return self._shot()
 
+    def _read_challenge(self, image: np.ndarray) -> Optional[ChallengeCount]:
+        if self.config.automation.auto_targeting:
+            return self.auto_targeting.read_challenge(image)
+        return self.challenge_reader.read(image)
+
     def _state_wait_prepare(self) -> None:
         timeout = self.config.timeouts.prepare
         if self.sm.has_timed_out(timeout):
             self._log("ERROR", "等待备战页面超时")
-            self.sm.transition(AutomationState.RECOVERY)
+            self.sm.transition(AutomationState.STOPPED if self.config.automation.auto_targeting else AutomationState.RECOVERY)
             return
         if self._wait(min(1.0, max(0.2, self.config.automation.click_delay))):
             raise StoppedError("用户停止")
@@ -539,7 +568,12 @@ class AutomationController:
         kind = self.detector.detect(image)
         if kind == ScreenKind.PREPARE:
             self._log("INFO", "当前页面：PREPARE")
+            self.ctx.auto_selection_attempts = 0
             self.sm.transition(AutomationState.PREPARE)
+            return
+        if kind == ScreenKind.PURCHASE and self.config.automation.auto_targeting:
+            self.ctx.pending_purchase = True
+            self.sm.transition(AutomationState.BUY_CHALLENGE)
             return
         if kind == ScreenKind.ARENA:
             # click may have failed
@@ -556,6 +590,7 @@ class AutomationController:
         result = self.buttons.find_go_win(image)
         if result.found:
             self._log("INFO", "检测到「去获胜」")
+            self.ctx.auto_selection_attempts = 0
             cx, cy = result.center
             self._safe_tap(cx, cy, label="去获胜")
             self.ctx.battle_started_at = time.monotonic()
@@ -754,7 +789,7 @@ class AutomationController:
                     self.sm.transition(AutomationState.PREPARE)
                     return
                 # Arena confirm: challenge ROI OCR is allowed (not full-screen).
-                count = self.challenge_reader.read(frame)
+                count = self._read_challenge(frame)
                 if count is not None:
                     self._log("INFO", "返回竞技场")
                     self.ctx.challenge = count
@@ -786,7 +821,7 @@ class AutomationController:
 
     def _state_check_challenge(self) -> None:
         image = self._shot()
-        challenge = self.challenge_reader.read(image)
+        challenge = self._read_challenge(image)
         if challenge is None:
             self.statistics.recognition_failures += 1
             self._emit_statistics()
@@ -801,6 +836,13 @@ class AutomationController:
         self.sm.transition(AutomationState.ARENA)
 
     def _state_buy_challenge(self) -> None:
+        if self.config.automation.auto_targeting and (
+            not self.config.purchase.enabled
+            or self.statistics.session_purchase_count >= self.config.purchase.max_per_session
+        ):
+            self._log("ERROR", "购买未授权或已达上限，自动选点模式安全停止")
+            self.sm.transition(AutomationState.STOPPED)
+            return
         if self.sm.has_timed_out(self.config.timeouts.purchase):
             self._log("ERROR", "购买挑战次数超时")
             self.sm.transition(AutomationState.RECOVERY)
@@ -821,6 +863,7 @@ class AutomationController:
         if self.ctx.pending_purchase and self.buttons.find_go_win(image).found:
             self._log("WARNING", "未出现购买弹窗，直接进入备战")
             self.ctx.pending_purchase = False
+            self.ctx.auto_selection_attempts = 0
             self.sm.transition(AutomationState.PREPARE)
             return
         if self._wait(1.0):
@@ -847,7 +890,7 @@ class AutomationController:
             return
 
         # 无「确认」按钮：点击「购买」可能已直接完成购买
-        count = self.challenge_reader.read(image)
+        count = self._read_challenge(image)
         previous = self.ctx.challenge
         if count is not None and count.current > 0 and (
             previous is None
@@ -894,7 +937,7 @@ class AutomationController:
             if i > 0 and self._wait(1.0):
                 raise StoppedError("用户停止")
             frame = self._shot()
-            count = self.challenge_reader.read(frame)
+            count = self._read_challenge(frame)
             if count is not None and (count.current > 0 or count.current > prev_n):
                 self._finish_purchase_success(count)
                 return

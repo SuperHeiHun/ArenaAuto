@@ -121,6 +121,7 @@ class DebugTestWorker(QThread):
         "defeat",
         "challenge",
         "powers",
+        "auto_targeting",
     )
 
     def __init__(
@@ -156,6 +157,15 @@ class DebugTestWorker(QThread):
             elif name == "arena":
                 kind = ctrl.detector.detect(image)
                 payload["screen"] = kind.value
+            elif name == "auto_targeting":
+                cards = ctrl.auto_targeting.scan(image)
+                annotated = ctrl.auto_targeting.draw(image)
+                payload["cards"] = [
+                    {"id": c.opponent.id, "power": c.opponent.power,
+                     "identity": c.identity, "click": list(c.opponent.click_position),
+                     "region": list(c.region), "source": c.target_source}
+                    for c in cards
+                ]
             elif name == "powers":
                 opponents = ctrl.power_reader.read_all(lambda: self.adb.screenshot())
                 payload["powers"] = [

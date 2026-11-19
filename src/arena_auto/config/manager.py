@@ -260,6 +260,8 @@ class ConfigManager:
             click_delay=float(data["automation"].get("click_delay", 0.3)),
             poll_interval=float(data["automation"].get("poll_interval", 5.0)),
             dry_run=bool(data["automation"].get("dry_run", False)),
+            auto_targeting=bool(data["automation"].get("auto_targeting", False)),
+            auto_targeting_max_attempts=max(1, int(data["automation"].get("auto_targeting_max_attempts", 2))),
         )
         recognition = RecognitionSettings(
             stable_reads=max(1, int(data["recognition"].get("stable_reads", 2))),

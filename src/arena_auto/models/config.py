@@ -29,6 +29,8 @@ class AutomationSettings:
     click_delay: float = 0.3
     poll_interval: float = 5.0
     dry_run: bool = False
+    auto_targeting: bool = False  # Experimental: visible card detection, no saved coordinates.
+    auto_targeting_max_attempts: int = 2
 
 
 @dataclass

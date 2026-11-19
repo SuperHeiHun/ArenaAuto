@@ -138,6 +138,10 @@ class MainWindow(QMainWindow):
         self.dry_run_check = QCheckBox("测试模式（不真实点击）")
         param_form.addRow(self.dry_run_check)
 
+        self.auto_target_check = QCheckBox("自动选对手（试验，无需坐标）")
+        self.auto_target_check.setToolTip("识别完整可见卡片和头像；不使用保存的对手/挑战次数坐标。建议先在开发/调试中测试自动选点。暂不自动滚动。")
+        param_form.addRow(self.auto_target_check)
+
         self.purchase_check = QCheckBox("自动购买挑战次数")
         self.auto_confirm_check = QCheckBox("自动确认购买")
         self.debug_check = QCheckBox("调试截图")
@@ -264,6 +268,7 @@ class MainWindow(QMainWindow):
             ("测试竞技场检测", "arena"),
             ("测试战力ROI", "powers"),
             ("测试挑战次数", "challenge"),
+            ("测试自动选点", "auto_targeting"),
         ]:
             btn = QPushButton(label)
             btn.clicked.connect(lambda _=False, n=name: self.run_debug_test(n))
@@ -354,6 +359,7 @@ class MainWindow(QMainWindow):
         self.threshold_edit.setText(str(cfg.automation.power_threshold))
         self.poll_spin.setValue(int(cfg.battle.poll_interval))
         self.dry_run_check.setChecked(cfg.automation.dry_run)
+        self.auto_target_check.setChecked(cfg.automation.auto_targeting)
         self.purchase_check.setChecked(cfg.purchase.enabled)
         self.auto_confirm_check.setChecked(cfg.purchase.auto_confirm)
         self.debug_check.setChecked(cfg.debug.enabled)
@@ -376,6 +382,7 @@ class MainWindow(QMainWindow):
         cfg.battle.poll_interval = float(self.poll_spin.value())
         cfg.automation.poll_interval = float(self.poll_spin.value())
         cfg.automation.dry_run = self.dry_run_check.isChecked()
+        cfg.automation.auto_targeting = self.auto_target_check.isChecked()
         cfg.purchase.enabled = self.purchase_check.isChecked()
         cfg.purchase.auto_confirm = self.auto_confirm_check.isChecked()
         cfg.debug.enabled = self.debug_check.isChecked()
@@ -670,6 +677,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.save_cfg_btn.setEnabled(False)
+        self.auto_target_check.setEnabled(False)
         # OCR loads on the automation worker thread — keep the GUI free.
         self.statusBar().showMessage("OCR 初始化中...")
         self.ocr_status_label.setText("OCR: 初始化中...")
@@ -687,6 +695,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.save_cfg_btn.setEnabled(True)
+        self.auto_target_check.setEnabled(True)
         self.statusBar().showMessage("已停止")
         if self._automation_thread is not None:
             self._automation_thread.quit()
@@ -789,6 +798,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ debug tools
     def run_debug_test(self, test_name: str) -> None:
+        if test_name == "auto_targeting" and (
+            self._automation_running() or (self._test_worker is not None and self._test_worker.isRunning())
+        ):
+            QMessageBox.warning(self, "测试自动选点", "请先停止自动化或等待识别测试完成")
+            return
         if not self._apply_form_to_config():
             return
         controller = self._ensure_controller()
@@ -808,6 +822,10 @@ class MainWindow(QMainWindow):
         if name == "ocr":
             texts = payload.get("texts") or []
             self.debug_payload_label.setText("OCR: " + (" | ".join(texts) if texts else "(空)"))
+        elif name == "auto_targeting":
+            cards = payload.get("cards") or []
+            lines = [f"#{c['id']} {c['identity']} 战力={c['power']} 点击={c['click']}（{c['source']}）" for c in cards]
+            self.debug_payload_label.setText("自动选点（仅分析，不点击）: " + ("; ".join(lines) if lines else "未找到可靠的完整卡片，不会使用旧坐标"))
         elif name == "arena":
             self.debug_payload_label.setText(f"页面识别: {payload.get('screen')}")
         elif name == "powers":
