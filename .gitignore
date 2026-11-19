@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+/logs/
+/debug/
+/data/
+*.log
+.idea/
+.vscode/
+*.pyc
+.DS_Store
+Thumbs.db
+testimg/
+prompt.md
+prompt2.md
+
+# Device-specific configuration and auto-generated templates stay local.
+/config/config.yaml
+/config/config.calibrated.yaml
+/resources/templates/generated/
