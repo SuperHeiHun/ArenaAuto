@@ -29,7 +29,7 @@ class AutomationSettings:
     click_delay: float = 0.3
     poll_interval: float = 5.0
     dry_run: bool = False
-    auto_targeting: bool = False  # Experimental: visible card detection, no saved coordinates.
+    auto_targeting: bool = False  # UI: 自动初始化. First-launch policy is in ConfigManager.
     auto_targeting_max_attempts: int = 2
 
 
@@ -59,7 +59,9 @@ class OcrSettings:
     whitelist: str = "0123456789,"
     lang: str = "ch"
     dpi: int = 300
-    device: str = "auto"  # auto | cpu | cuda
+    device: str = "auto"  # auto | cpu | cuda (EasyOCR) | directml (RapidOCR)
+    gpu_device_id: int = 0
+    gpu_fallback_to_cpu: bool = True
     timeout_ms: int = 1500
     cache_enabled: bool = True
     cache_difference_threshold: float = 3.0
@@ -78,6 +80,7 @@ class LoggingSettings:
 class BattleSettings:
     poll_interval: float = 5.0
     max_duration: float = 300.0
+    result_ocr_interval: float = 15.0  # Auto mode: cooldown after a result OCR probe.
 
 
 @dataclass

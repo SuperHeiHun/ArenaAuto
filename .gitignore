@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.venv-gpu/
+.venv-build/
 venv/
 build/
 dist/
@@ -22,3 +24,6 @@ prompt2.md
 /config/config.yaml
 /config/config.calibrated.yaml
 /resources/templates/generated/
+
+# Local project memory (hardware, diagnostics and deferred work).
+/MEMORY.md

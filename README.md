@@ -53,9 +53,9 @@ adb devices
 2. USB 连接，或无线：`adb pair <ip>:<配对端口>` → `adb connect <ip>:5555`
 3. `adb devices` 显示 `device` 状态即可
 
-**无线 ADB（程序内）**：自动配置步骤 1 支持直接填 `IP:端口` / 配对码 / 配对端口：
+**无线 ADB（程序内）**：半自动配置步骤 1 支持直接填 `IP:端口` / 配对码 / 配对端口：
 
-主界面 **ADB设备 → 无线连接** 也可直接连接，无需进入自动配置向导：
+主界面 **ADB设备 → 无线连接** 也可直接连接，无需进入半自动配置向导：
 
 1. 手机与电脑连接同一局域网，手机打开「开发者选项 → 无线调试」。
 2. **已配对**：填写无线调试主页显示的「连接地址 IP:端口」，点击「连接设备」。
@@ -83,9 +83,52 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt
 ```
 
+### 6.1 GPU OCR（Windows AMD/Intel/NVIDIA 显卡）
+
+AMD/Intel 显卡无法通过 EasyOCR（CUDA）加速。项目提供基于 **RapidOCR + ONNX Runtime DirectML** 的可选 OCR 后端，检测与识别模型都跑在显卡上（DirectML 官方支持 AMD GCN 1 代及以上，RX 580 满足要求）。
+
+在项目目录执行（使用独立环境，不改动现有 Python/CUDA 设置）：
+
+```bat
+python -m venv --system-site-packages .venv-gpu
+.venv-gpu\Scripts\python.exe -m pip install -r requirements-gpu.txt
+```
+
+然后双击 `start_gpu.bat`（或 `.venv-gpu\Scripts\python.exe scripts\run_gpu.py`）。启动脚本只选择装有 GPU 依赖的 Python 环境，OCR 引擎和设备**以保存的 Config 为准**，不会强制覆盖。首次没有配置时选择可用的 rapidocr + auto；已有配置可在主界面选择 rapidocr + directml 后点「保存配置」。
+
+以上命令用于源码运行。GitHub Actions 构建的桌面版已包含 RapidOCR、DirectML 运行时和模型，直接运行 `ArenaAuto.exe`；首次无配置时选择 RapidOCR + auto，并默认开启「自动初始化」。有可用 DirectML 时使用 GPU，否则明确回退 CPU，无需另外安装 Python 或模型。
+
+- **OCR 设备**：`directml`（AMD/Intel/NVIDIA 均可）、`cuda`（NVIDIA，配合 easyocr）、`cpu`、`auto`。
+- **GPU 编号**：DirectML 的 DXGI 显卡编号，双显卡机器可改 0/1；不是 ADB 设备编号。
+- **GPU 不可用时回退 CPU**：开启后 DirectML 初始化或推理失败会自动退回 CPU 并在日志中说明；关闭则直接报错，不会把 CPU 误标成 GPU。
+- 运行时日志 `OCR Ready (rapidocr) device=DirectML GPU 0` 表示 GPU 生效；`device=CPU` 表示回退。
+- 验证（只读本地图片，不连接设备）：`.venv-gpu\Scripts\python.exe scripts\check_gpu_ocr.py testimg\选择对手.jpg testimg\结算.jpg --targeting`
+
+本机实测（1600×720，RX 580，暖机后）：整图 OCR 约 0.4–0.7 秒，对比同模型 CPU 约 2.3 秒；包含数字多帧复核的自动选人阶段约 0.6 秒（原 EasyOCR CPU 约 11 秒）。数字为参考值，不同显卡/驱动会有差异。
+
+已验证的行为与限制：
+
+- 检测和识别两个会话都会确认 `DmlExecutionProvider` 生效，只挂上 GPU 名称但实际走 CPU 的会话会被拒绝。
+- 会话按 DirectML 要求关闭内存模式并串行执行；识别调用使用锁保护。
+- 数字 ROI 自动改用“仅识别”模式跳过重复的文本检测，速度更快。
+- RapidOCR 没有 EasyOCR 的数字白名单；战力仍由严格解析和数字 ROI 多帧校验把关，不会把“金币67499”当战力。
+- 新模型可能把挑战次数 `4/5` 的斜杠读成 `1`。程序只在图中确认存在斜杠字形后，才分别复核两侧数字；没有斜杠证据不会把 `415` 猜成 `4/5`。
+- 需要网络下载仅限安装依赖本身；OCR 模型随 wheel 内置（约 30 MB），首次运行不再下载模型。
+- PyInstaller 打包：装好 GPU 依赖后，`ArenaAuto.spec` 会自动收集 RapidOCR/ONNX Runtime 的 DLL、配置和模型；未安装这些包的普通构建不受影响。
+
 ## 7. 配置 YAML
 
-配置文件：`config/config.yaml`（首次启动若不存在会自动创建默认值）。
+配置文件：`config/config.yaml`（首次启动若不存在会自动创建，默认开启「自动初始化」）。已有配置中明确保存的开关、设备、坐标和购买设置会保留；旧配置没有模式开关且没有有效对手坐标时，也默认启用自动初始化。
+
+OCR 引擎选择统一保存在 Config 的 `ocr` 节点，主界面「OCR 引擎 / OCR 设备 / GPU 编号」选择后点「保存配置」，下次启动会恢复。可参考不含设备信息的 `config/config.example.yaml`；运行配置仍是 `config/config.yaml`，示例不会自动覆盖它。
+
+```yaml
+ocr:
+  provider: rapidocr         # rapidocr | easyocr | paddle | tesseract
+  device: auto              # auto | cpu | directml（RapidOCR）| cuda（EasyOCR）
+  gpu_device_id: 0
+  gpu_fallback_to_cpu: true
+```
 
 关键项：
 
@@ -93,6 +136,7 @@ pip install -r requirements-dev.txt
 |---|---|
 | `automation.power_threshold` | 战力阈值 |
 | `automation.dry_run` | true = 只打日志不点击 |
+| `automation.auto_targeting` | 界面「自动初始化」开关，保留旧配置键以兼容升级 |
 | `battle.poll_interval` | 战斗中检测间隔（秒） |
 | `purchase.*` | 是否自动购买挑战次数；`buy_button`/`confirm_button` 为标定几何 |
 | `opponents[].power_region` | 战力 ROI `[x,y,width,height]` |
@@ -107,7 +151,7 @@ pip install -r requirements-dev.txt
 | `buttons.*` | 标定按钮几何：`region/click/confidence/source` |
 | `result.*` | 结算页 `victory/defeat/exit` 几何 |
 
-**当前仓库不包含真实游戏坐标**，默认 `power_region` / `click` 为占位值 `[0,0,100,50]` / `[0,0]`，必须按你的设备截图修改或使用自动标定。点击坐标为 `(0,0)` 时程序会拒绝点击并进入恢复流程（防误触）。
+**当前仓库不包含真实游戏坐标**，默认 `power_region` / `click` 为占位值 `[0,0,100,50]` / `[0,0]`。开启「自动初始化」时从截图实时识别，无需填这些占位项；关闭后才需要通过半自动配置或手动编辑补齐。点击坐标为 `(0,0)` 时程序会拒绝点击（防误触）。
 
 配置来源优先级：
 
@@ -119,22 +163,22 @@ manual（手动修改，confidence=1.0）
 
 手动修改过的区域（`source: manual`）在重新标定时不会被覆盖。
 
-**对手点击位置调整**：自动配置步骤 3/4 中，粉色点表示选择对手时的点击位置，绿色/黄色 ROI 是战力识别区域，两者独立。可直接拖动任意粉色点（不必先点战力框）；也可在右侧选中对应对手，点击「设置点击位置」，再点击截图内实际可选中的对手卡片/按钮位置。设置后自动退出点选模式，保存时按参考分辨率换算坐标。此操作只修改配置，不会点击手机。
+**对手点击位置调整**：半自动配置步骤 3/4 中，粉色点表示选择对手时的点击位置，绿色/黄色 ROI 是战力识别区域，两者独立。可直接拖动任意粉色点（不必先点战力框）；也可在右侧选中对应对手，点击「设置点击位置」，再点击截图内实际可选中的对手卡片/按钮位置。设置后自动退出点选模式，保存时按参考分辨率换算坐标。此操作只修改配置，不会点击手机。
 
-## 8. 自动标定（自动配置）
+## 8. 半自动配置（自动标定向导）
 
 三种配置模式，最终生成相同的数据结构：
 
 | 模式 | 入口 | 说明 |
 |---|---|---|
-| 自动标定 | 主界面 `[自动配置]` | 截图 → 自动分析 → 用户确认 → 保存 |
+| 自动标定 | 主界面 `[半自动配置]` | 截图 → 自动分析 → 用户确认 → 保存 |
 | 半自动修正 | 向导内 `[调整]` | 拖动 ROI / 点击点 / 重新分析后保存（`source=manual`） |
 | 手动配置 | 主界面 `[手动配置]` | 直接编辑 YAML，程序打开 `config/config.yaml` |
 
 ### 使用方法
 
 1. 连接 Android，打开游戏**竞技场页面**
-2. 点击 `[自动配置]`（或 `[重新标定]` 直接进入并允许替换）
+2. 点击 `[半自动配置]`（或 `[重新标定]` 直接进入并允许替换）
 3. 按向导 7 步确认：
 
 ```text
@@ -160,7 +204,7 @@ manual（手动修改，confidence=1.0）
 ### 主界面按钮
 
 ```text
-[自动配置]   打开标定向导
+[半自动配置] 打开标定向导
 [重新标定]   直接进入向导，允许替换配置
 [测试配置]   重新截图识别竞技场/1~5 战力/挑战次数/去获胜/退出，绝不点击
 [手动配置]   用系统编辑器打开 config.yaml
@@ -237,6 +281,10 @@ resources/templates/
 
 或使用 GUI「开发/调试 → 从当前截图创建模板」。模板缺失时程序仍可启动，GUI 会提示；按钮识别会尝试 OCR 文案 fallback。
 
+**结算艺术字**：胜负文案支持 `胜  利`、`失  败` 等字间空格，也支持同一行相邻 OCR 字框的合并识别。胜负判断使用独立结果标签，不会把标题「胜利者的竞技场」当作胜利。半自动配置在结算页检测到大字后可生成胜利模板；手动配置模式的战斗循环默认仍只使用模板，自动初始化模式有独立的限频结算 OCR 兜底。
+
+失败页与胜利页使用同一套识别规则。在半自动配置的按钮检测步骤切换到「失败结算页」，可自动识别 `失  败` 或分开的「失」「败」并生成 `defeat` 模板；保存配置后，正常战斗循环可用该模板识别 `LOSE` 并计入失败统计。模板必须来自真实失败截图，不使用胜利截图替代。
+
 ## 10. 启动程序
 
 任选其一（推荐直接双击 `start.bat`）：
@@ -277,21 +325,28 @@ python scripts/run.py
 
 ## 11. 第一次运行流程
 
-### 试验版：自动选对手（无需对手坐标）
+### 自动初始化（正式功能，无需预设对手坐标）
 
-主界面勾选 **「自动选对手（试验，无需坐标）」**，即可绕过保存的对手 ROI/点击坐标，通过当前截图定位完整对手卡片，优先选择头像作为点击位置；头像不明确时使用已识别的卡片名称位置。挑战次数也从配置中的文字关键词附近自动读取，无需填写挑战次数 ROI。
+主界面勾选 **「自动初始化」**，即可绕过保存的对手 ROI/点击坐标，通过当前截图定位完整对手卡片；点击点直接复用半自动配置的算法，根据战力 ROI 向左扩展后取中心，使用相同的 `calibration.power_region_padding`、`calibration.card_extend_left` 和参考分辨率缩放。不再点击昵称/头像，也不另用卡片右侧规则。挑战次数从配置中的文字关键词附近自动读取，无需填写挑战次数 ROI。
+
+自动初始化的整图 OCR 与半自动配置共用 `recognition/ocr_pipeline.py`：使用当前选择的 OCR 引擎、设备和 `ocr.*` 参数，原始截图优先，空结果或异常时再预处理重试，统一输出 `OCRBox(text, confidence, bbox)`。预处理放大后的识别框会换算回原截图像素，不会把放大坐标当成 ROI 或点击坐标。日志中的「布局定位输入」会显示本次使用原始还是预处理截图。数字 ROI 的多帧稳定校验和点击前图像比对仍然保留。
 
 建议先打开竞技场，在 **开发/调试 → 测试自动选点** 检查绿框与粉色十字，再使用测试模式（dry_run）检查点击日志。这个测试只分析截图，绝不点击或修改坐标配置。
 
-当前为第一阶段原型，限制如下：
+适用范围与安全限制：
 
-- 支持浅色横向对手卡片，需要「请选择对手」、战力及玩家名称 OCR 锚点，以及至少两行真实战力建立间距。
+- 支持浅色横向对手卡片，需要「请选择对手」、战力标签及玩家名称 OCR 锚点，至少两行可靠战力标签建立间距。整图数字低置信度/缺失不会直接废弃整行布局，实际战力必须通过数字 ROI 复核。
 - 只处理当前完整可见的卡片，跳过底部截断卡片，不推导不存在的第 5 个槽位，**暂不自动滚动**。
-- 点击前至少用两张新截图确认列表身份、战力及位置稳定；发生刷新或识别不确定时停止，不回退到旧坐标。
+- 每次先做一次整图布局定位，再按 1→N 顺序只对需要读取的对手进行至少两次**新截图数字 ROI 校验**。首个合格对手确定后不再要求后续卡片的昵称/战力一致。卡片图像变化、前序对手无法验证或数字不稳定时会有限次数重新定位，仍不可靠才停止，不回退到旧坐标。
 - 点击后仍通过备战/购买页面验证；重复点击未进入备战时最多尝试 `automation.auto_targeting_max_attempts` 次（默认 2）后停止。
-- 此开关仅改变对手选择和挑战次数读取。开始/购买/退出/结算仍使用现有模板/OCR流程，**尚不是完全无需模板的全流程开箱即用版本**，也不会自动开启战斗阶段的 OCR fallback。
-- 原手动配置模式保持不变，此功能默认关闭；购买开关与上限仍然有效。
-- CPU 整帧 OCR 较慢，本机 1600×720 示例单次约 12.6 秒；稳定校验需要多帧，当前以安全性优先，后续再优化 ROI 和缓存。
+- 点击后先等待短暂页面切换，不会因第一张截图仍为竞技场就立即重复点击。开启调试截图时，`debug/prepare/` 保存点击后页面与未切页诊断图，日志输出落点来源、卡片范围及坐标。
+- 自动模式在结算模板缺失/连续未命中时会执行限频 OCR 兜底，无需额外勾选 `debug.allow_ocr_fallback`。识别到独立胜负标签及退出按钮后，将当前截图的文案裁剪缓存为**内存模板**，后续优先快速匹配，不覆盖模板 PNG 或修改坐标配置。
+- 自动模式的退出按钮也允许现场 OCR 定位，避免已识别结算却因没有退出模板/ROI 无法返回竞技场；未知胜负不会计入胜利或失败统计。
+- 首次无配置时默认开启；已有配置的明确选择保持不变。原手动配置模式仍可用，购买开关与上限仍然有效。
+- 开始运行时显示「开始自动初始化」确认框，说明自动识别、缺失模板时 OCR 兜底、战力阈值、购买开关和测试模式，不再要求先创建模板；取消不会启动自动化。
+- CPU 整帧 OCR 仍较慢，目前只用于每次布局定位；后续确认改为小数字 ROI。离线样本中模型暖机后的对手选择阶段约 11 秒，主要时间来自一次整图 OCR，数字复核通常只需数百毫秒；首次模型初始化会额外耗时。
+
+布局预览中的 `raw` 战力只是整图初读；运行时的 `ok` 战力已通过数字 ROI 多帧校验。日志会记录每个 ROI 的实际读数与重试原因。确认读数时强制绕过 OCR 缓存，避免用同一次识别冒充多帧稳定。工作线程日志通过 Qt 排队信号实时送到主界面，不再等自动化停止后集中显示。
 
 离线预览（不连接设备）：
 
@@ -302,9 +357,11 @@ python scripts/preview_auto_targeting.py "testimg/选择对手.jpg"
 
 输出默认保存到 `debug/auto_targeting_preview.png`。示例截图属于本地测试资料，不提交到 Git，需使用你自己的竞技场截图。
 
+结算兜底默认在模板连续失败 3 次后启动（`debug.ocr_fallback_min_failures`）；每次 OCR 完成后至少等待 `battle.result_ocr_interval` 秒才允许下次探测（默认 15 秒），避免 CPU 每帧整图识别。等待超过战斗/结算超时且仍无可靠证据时，自动模式安全停止，不重复重置计时。运行期间不能同时启动调试识别或创建模板；截图预览不会把表单参数重新写进运行配置。
+
 1. 连接设备 → 打开程序 → 「刷新设备」选择 serial  
 2. 截图确认游戏停留在**竞技场页面**  
-3. 点击 **[自动配置]**，按向导确认对手/战力/按钮并保存（见第 8 节）  
+3. 默认使用 **自动初始化**，可先运行「测试自动选点」查看落点；需要人工标定时点击 **[半自动配置]**（见第 8 节）
 4. 或手动：用「测试竞技场检测 / 测试OCR / 测试战力ROI」校验识别，修改 `power_region`、`click`、`challenge_count.region`  
 5. 点 **[测试配置]** 校验当前配置（不点击）  
 6. 建议先勾选 **测试模式（dry_run）** 跑一轮，确认日志里的点击坐标  
@@ -324,8 +381,10 @@ python scripts/preview_auto_targeting.py "testimg/选择对手.jpg"
 
 ```yaml
 ocr:
-  provider: paddle   # paddle | tesseract | easyocr
-  device: auto       # auto | cpu | cuda（EasyOCR）
+  provider: paddle   # paddle | tesseract | easyocr | rapidocr
+  device: auto       # auto | cpu | cuda（EasyOCR）| directml（RapidOCR）
+  gpu_device_id: 0   # DirectML DXGI 显卡编号
+  gpu_fallback_to_cpu: true
   scale: 3           # ROI 放大倍数
   threshold: true    # 二值化
   whitelist: "0123456789,"
@@ -407,7 +466,15 @@ pyinstaller ArenaAuto.spec
 ```
 
 产物：`dist/ArenaAuto/`（含 `ArenaAuto.exe`）。  
-`resources/` 与 `config/` 会打进包内；用户可改的 `config/config.yaml`、模板、日志、debug、data 在 exe 同级外部目录生成。
+包内包含通用资源以及已安装的 RapidOCR/ONNX Runtime DLL 与 OCR 模型。不会打入开发者的 `config/`、ZIP 备份或 `resources/templates/generated/` 本地截图；首次启动在 exe 同级生成干净配置，模板、日志、debug、data 也放在 exe 同级目录。
+
+### GitHub Actions 构建与发布
+
+- `main` 推送、面向 `main` 的 PR、手动运行以及 `v*` 标签均会构建 Windows x64 版本。
+- Python 3.12 + `requirements-build.txt` 安装桌面依赖、DirectML OCR、内置模型和 PyInstaller，不安装 Paddle/PyTorch/CUDA。
+- 构建前跑回归测试和源码 OCR 自检；构建后实际运行 `ArenaAuto.exe --self-test --report ...`，在 CPU 上加载打包 DLL/模型并推理，CI 无需显卡或 Android 设备。
+- 通过后上传包含完整程序目录的 ZIP 与 SHA256；只有 `v*` 标签构建通过才创建 GitHub Release，普通分支/PR 不发布。
+- 已解压程序无需外部 Python 环境。DirectML 由当前显卡/驱动决定，无法启用时明确回退 CPU。
 
 ## 16. 测试
 
@@ -457,7 +524,7 @@ pytest tests -q
 
 1. 看 `debug/failed/power_*.png` 是否裁剪正确  
 2. 调整 `power_region` 与 `ocr.scale`  
-3. 切换 `ocr.provider`  
+3. 切换 `ocr.provider`（AMD 显卡可试 rapidocr + directml，见 6.1 节）
 4. 确认文字清晰、无动画遮挡  
 5. 保持 `stable_reads>=2` 防抖  
 

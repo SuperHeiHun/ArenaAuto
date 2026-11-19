@@ -1,0 +1,4 @@
+# Optional Windows AMD/Intel/NVIDIA DirectML OCR backend.
+# Install in an isolated environment; do not co-install other onnxruntime wheels.
+rapidocr==3.10.0
+onnxruntime-directml==1.24.4

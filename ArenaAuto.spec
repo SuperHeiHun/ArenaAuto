@@ -5,14 +5,25 @@ block_cipher = None
 
 project_root = SPECPATH  # noqa: F821 - provided by PyInstaller
 
-datas = [
-    ("resources", "resources"),
-    ("config", "config"),
-]
+from importlib.util import find_spec
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
+
+optional_binaries = []
+
+# Do not package the developer's local config, ZIP backups or generated crops.
+# Fresh installs create an auto-initialization config next to the executable.
+datas = []
+resource_root = Path(project_root) / "resources"
+for asset in sorted(resource_root.rglob("*")):
+    relative = asset.relative_to(resource_root)
+    if asset.is_file() and "generated" not in relative.parts:
+        datas.append((str(asset), str(Path("resources") / relative.parent)))
 
 hiddenimports = [
     "arena_auto",
     "arena_auto.app",
+    "arena_auto.runtime_check",
     "arena_auto.paths",
     "arena_auto.exceptions",
     "arena_auto.adb",
@@ -26,6 +37,8 @@ hiddenimports = [
     "arena_auto.recognition.detector",
     "arena_auto.recognition.ocr",
     "arena_auto.recognition.ocr_engine",
+    "arena_auto.recognition.ocr_pipeline",
+    "arena_auto.recognition.rapidocr_provider",
     "arena_auto.recognition.screen",
     "arena_auto.recognition.template",
     "arena_auto.config",
@@ -54,10 +67,19 @@ hiddenimports = [
     "arena_auto.calibration.wizard",
 ]
 
+# GPU build: package the optional runtime DLLs, YAML and bundled ONNX models.
+# Normal builds do not require or download these dependencies.
+for package in ("rapidocr", "onnxruntime"):
+    if find_spec(package) is not None:
+        pkg_datas, pkg_binaries, pkg_imports = collect_all(package)
+        datas += pkg_datas
+        optional_binaries += pkg_binaries
+        hiddenimports += pkg_imports
+
 a = Analysis(
     ["main.py"],
     pathex=["src"],
-    binaries=[],
+    binaries=optional_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

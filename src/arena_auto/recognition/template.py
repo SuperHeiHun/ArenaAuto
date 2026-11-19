@@ -30,6 +30,8 @@ class TemplateRecognizer:
     ) -> None:
         self._entries: Dict[str, TemplateEntry] = dict(templates or {})
         self._cache: Dict[str, np.ndarray] = {}
+        self._runtime_templates: Dict[str, np.ndarray] = {}
+        self._runtime_signatures: Dict[str, tuple[str, float]] = {}
         self._base_dir = Path(base_dir) if base_dir else None
         self.multi_scale = multi_scale
         self.scales = tuple(scales)
@@ -42,8 +44,34 @@ class TemplateRecognizer:
     def register(self, name: str, entry: TemplateEntry) -> None:
         self._entries[name] = entry
         self._cache.pop(name, None)
+        self._runtime_templates.pop(name, None)
+        self._runtime_signatures.pop(name, None)
+
+    def register_image(self, name: str, image: np.ndarray) -> bool:
+        """Learn a verified live label crop in memory; never overwrites PNGs/config."""
+        if name not in self._entries or image is None or image.size == 0:
+            return False
+        if image.shape[0] < 5 or image.shape[1] < 5:
+            return False
+        gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if float(gray.std()) < 1.0:
+            return False
+        self._runtime_templates[name] = image.copy()
+        entry = self._entries[name]
+        self._runtime_signatures[name] = (entry.path, entry.threshold)
+        self._cache.pop(name, None)
+        self._cache.pop(f"__miss__{name}", None)
+        return True
 
     def set_entries(self, templates: Dict[str, TemplateEntry]) -> None:
+        # Preserve learned templates on a routine reload, but explicit path or
+        # threshold changes invalidate them so manual configuration still wins.
+        for name in list(self._runtime_templates):
+            entry = templates.get(name)
+            signature = (entry.path, entry.threshold) if entry is not None else None
+            if self._runtime_signatures.get(name) != signature:
+                self._runtime_templates.pop(name)
+                self._runtime_signatures.pop(name, None)
         self._entries = dict(templates)
         self._cache.clear()
 
@@ -66,7 +94,7 @@ class TemplateRecognizer:
         return path
 
     def is_loaded(self, name: str) -> bool:
-        return name in self._cache
+        return name in self._cache or name in self._runtime_templates
 
     def missing_templates(self) -> List[str]:
         missing = []
@@ -80,6 +108,11 @@ class TemplateRecognizer:
 
     # ------------------------------------------------------------------- load
     def load(self, name: str, force: bool = False) -> Optional[np.ndarray]:
+        if not force and name in self._runtime_templates:
+            return self._runtime_templates[name]
+        if force:
+            self._runtime_templates.pop(name, None)
+            self._runtime_signatures.pop(name, None)
         if not force and name in self._cache:
             return self._cache[name]
         # Remember missing/invalid paths so detect() does not re-stat every frame.

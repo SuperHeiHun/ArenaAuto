@@ -1,0 +1,20 @@
+# Copy selected settings into config/config.yaml, or use the GUI Save button.
+# This is a portable example: no device serial, local paths or calibrated coordinates.
+version: 2
+
+automation:
+  auto_targeting: true   # UI: 自动初始化；旧键保留兼容
+  power_threshold: 2000000
+
+ocr:
+  # 引擎：rapidocr | easyocr | paddle | tesseract
+  provider: rapidocr
+  # 设备：auto | cpu | directml (RapidOCR) | cuda (EasyOCR)
+  device: auto
+  gpu_device_id: 0
+  gpu_fallback_to_cpu: true
+  scale: 3
+  threshold: true
+  timeout_ms: 1500       # 软预算，只告警，不中断识别
+  power_allowlist: "0123456789,."
+  challenge_allowlist: "0123456789/"

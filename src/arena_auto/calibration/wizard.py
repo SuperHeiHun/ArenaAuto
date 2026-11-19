@@ -733,7 +733,7 @@ class CalibrationWizard(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(
-            "ArenaAuto - 重新标定" if recalibrate else "ArenaAuto - 自动配置"
+            "ArenaAuto - 重新标定" if recalibrate else "ArenaAuto - 半自动配置"
         )
         self.resize(1280, 860)
         self.config_manager = config_manager
@@ -1075,7 +1075,7 @@ class CalibrationWizard(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        group = QGroupBox("自动配置完成情况")
+        group = QGroupBox("半自动配置完成情况")
         grid = QGridLayout(group)
         self.summary_labels: Dict[str, QLabel] = {}
         rows = (
@@ -1266,7 +1266,7 @@ class CalibrationWizard(QDialog):
     def _on_worker_failed(self, task: str, message: str) -> None:
         self.status_label.setText(f"失败: {message}")
         self.device_log.appendPlainText(f"[{task}] 失败: {message}")
-        QMessageBox.warning(self, "自动配置", f"{task} 失败:\n{message}")
+        QMessageBox.warning(self, "半自动配置", f"{task} 失败:\n{message}")
 
     def _on_worker_result(self, task: str, payload: dict) -> None:
         if task == "devices":
@@ -1867,8 +1867,8 @@ class CalibrationWizard(QDialog):
             logger.info("[CALIBRATION] 配置已保存: %s", self.saved_path)
             QMessageBox.information(
                 self,
-                "自动配置",
-                f"自动配置完成\n\n配置文件:\n{self.saved_path}",
+                "半自动配置",
+                f"半自动配置完成\n\n配置文件:\n{self.saved_path}",
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("保存配置失败")

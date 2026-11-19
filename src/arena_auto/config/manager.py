@@ -180,11 +180,23 @@ class ConfigManager:
         self.last_error: str = ""
 
     # ------------------------------------------------------------------ factory
+    @staticmethod
+    def initial_config() -> AppConfig:
+        """First launch needs no calibration; retain explicit existing choices."""
+        from importlib.util import find_spec
+
+        config = AppConfig()
+        config.automation.auto_targeting = True
+        if find_spec("rapidocr") is not None and find_spec("onnxruntime") is not None:
+            config.ocr.provider = "rapidocr"
+            config.ocr.device = "auto"
+        return config
+
     @classmethod
     def load_or_create(cls, path: Optional[Path] = None) -> "ConfigManager":
         manager = cls(path=path)
         if not manager.path.exists():
-            manager.config = AppConfig()
+            manager.config = cls.initial_config()
             manager.save()
             logger.info("已创建默认配置: %s", manager.path)
             return manager
@@ -194,7 +206,7 @@ class ConfigManager:
     # --------------------------------------------------------------------- io
     def load(self) -> AppConfig:
         if not self.path.exists():
-            self.config = AppConfig()
+            self.config = self.initial_config()
             self.save()
             return self.config
         try:
@@ -293,6 +305,8 @@ class ConfigManager:
             lang=str(ocr_raw.get("lang", "ch")),
             dpi=int(ocr_raw.get("dpi", 300)),
             device=str(ocr_raw.get("device", "auto")),
+            gpu_device_id=int(ocr_raw.get("gpu_device_id", 0)),
+            gpu_fallback_to_cpu=bool(ocr_raw.get("gpu_fallback_to_cpu", True)),
             timeout_ms=max(0, int(ocr_raw.get("timeout_ms", 1500))),
             cache_enabled=cache_enabled,
             cache_difference_threshold=cache_threshold,
@@ -320,6 +334,7 @@ class ConfigManager:
         battle = BattleSettings(
             poll_interval=float(data["battle"].get("poll_interval", 5.0)),
             max_duration=float(data["battle"].get("max_duration", 300.0)),
+            result_ocr_interval=float(data["battle"].get("result_ocr_interval", 15.0)),
         )
         purchase = PurchaseSettings(
             enabled=bool(data["purchase"].get("enabled", True)),
@@ -528,6 +543,15 @@ class ConfigManager:
             templates=templates,
             profile=profile,
         )
+        # An old/empty YAML without this mode flag needs initialization only
+        # when no usable opponent geometry exists. An explicit false is a user
+        # choice and must survive upgrades, including partially filled configs.
+        if "auto_targeting" not in (raw.get("automation") or {}):
+            config.automation.auto_targeting = not any(
+                tuple(o.power_region) != (0, 0, 100, 50)
+                and o.power_region[2] > 0 and o.power_region[3] > 0
+                and tuple(o.click) != (0, 0) for o in config.opponents
+            )
         cls.validate(config)
         return config
 
@@ -539,8 +563,12 @@ class ConfigManager:
             raise ConfigError("power_threshold 必须是数字且不能为负")
         if config.battle.poll_interval <= 0:
             raise ConfigError("battle.poll_interval 必须大于 0")
+        if config.battle.result_ocr_interval <= 0:
+            raise ConfigError("battle.result_ocr_interval 必须大于 0")
         if config.recognition.stable_reads < 1:
             raise ConfigError("recognition.stable_reads 至少为 1")
+        if config.ocr.gpu_device_id < 0:
+            raise ConfigError("ocr.gpu_device_id 不能为负数")
         if config.purchase.max_per_session < 0:
             raise ConfigError("purchase.max_per_session 不能为负")
         if config.screen.reference_width <= 0 or config.screen.reference_height <= 0:

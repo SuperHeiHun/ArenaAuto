@@ -527,8 +527,9 @@ class OpponentDetector:
         screen_h: int,
     ) -> CalibrationDetection:
         bbox = cand.bbox
-        power_region = self.roi.power_region_from_bbox(bbox)
-        card = self._card_region(power_region, spacing, screen_w, screen_h)
+        power_region, click_point = self.power_geometry_from_bbox(
+            bbox, spacing, bounds=(screen_w, screen_h)
+        )
         if source == SOURCE_OCR:
             detail = f"战力：{cand.value:,}" if cand.value else ""
             logger.info(
@@ -542,12 +543,28 @@ class OpponentDetector:
         return CalibrationDetection(
             name=f"opponent_{slot_id}",
             region=power_region,
-            click_point=card.center,
+            click_point=click_point,
             confidence=max(0.0, min(1.0, confidence)),
             source=source,
             value=cand.value if cand.value else None,
             detail=detail,
         )
+
+    def power_geometry_from_bbox(
+        self,
+        bbox: Tuple[int, int, int, int],
+        spacing: Optional[float] = None,
+        bounds: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[CalibrationRegion, CalibrationPoint]:
+        """Shared calibration geometry: expand power ROI, then offset click left.
+
+        Inputs and outputs are actual screenshot pixels. Padding and the left
+        extension use the configured reference resolution through this mapper.
+        """
+        power_region = self.roi.power_region_from_bbox(bbox)
+        screen_w, screen_h = bounds or (self.mapper.actual_width, self.mapper.actual_height)
+        card = self._card_region(power_region, spacing, screen_w, screen_h)
+        return power_region, card.center
 
     def _card_region(
         self,

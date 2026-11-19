@@ -45,6 +45,7 @@ from arena_auto.recognition.ocr_engine import (
 )
 from arena_auto.recognition.screen import CoordinateScaler, crop_region
 from arena_auto.recognition.template import TemplateRecognizer
+from arena_auto.recognition.result_text import find_result_text_boxes, normalize_ui_text
 
 logger = logging.getLogger(__name__)
 
@@ -151,18 +152,21 @@ class ScreenDetector:
             ScreenKind.PURCHASE: self._count_hits(
                 text_blob, [profile.buy_text, profile.confirm_text]
             ),
-            ScreenKind.RESULT: self._count_hits(
-                text_blob,
-                [profile.victory_text, profile.defeat_text, profile.exit_text],
-            ),
+            ScreenKind.RESULT: int(bool(find_result_text_boxes(boxes, profile.exit_text)))
+            + int(bool(find_result_text_boxes(boxes, profile.victory_text, companions=profile.exit_text)))
+            + int(bool(find_result_text_boxes(boxes, profile.defeat_text, companions=profile.exit_text))),
         }
 
         result_hit = scores[ScreenKind.RESULT]
         title_hits = self._count_hits(text_blob, profile.arena_title_keywords)
         go_win_hit = scores[ScreenKind.PREPARE]
         buy_hit = self._count_hits(text_blob, [profile.buy_text])
+        result_label_hit = bool(find_result_text_boxes(boxes, profile.victory_text, companions=profile.exit_text)
+                                or find_result_text_boxes(boxes, profile.defeat_text, companions=profile.exit_text))
         if buy_hit >= 1:
             kind = ScreenKind.PURCHASE
+        elif result_label_hit:
+            kind = ScreenKind.RESULT
         elif title_hits >= 1 and scores[ScreenKind.ARENA] >= 2:
             kind = ScreenKind.ARENA
         elif result_hit >= 2:
@@ -175,7 +179,7 @@ class ScreenDetector:
             kind = ScreenKind.PREPARE
         elif scores[ScreenKind.PURCHASE] >= 1:
             kind = ScreenKind.PURCHASE
-        elif result_hit >= 1 and self._count_hits(text_blob, [profile.exit_text]):
+        elif result_hit >= 1 and find_result_text_boxes(boxes, profile.exit_text):
             kind = ScreenKind.RESULT
         else:
             kind = ScreenKind.UNKNOWN
@@ -283,7 +287,6 @@ class ScreenDetector:
 
         if boxes is None:
             boxes = self._recognize_all(screenshot)
-        text_blob = _join_texts(boxes)
         profile = self.config.profile
 
         victory_tpl = False
@@ -292,8 +295,8 @@ class ScreenDetector:
             victory_tpl = self.templates.find(screenshot, "victory").found
             defeat_tpl = self.templates.find(screenshot, "defeat").found
 
-        has_victory = victory_tpl or self._count_hits(text_blob, [profile.victory_text]) > 0
-        has_defeat = defeat_tpl or self._count_hits(text_blob, [profile.defeat_text]) > 0
+        has_victory = victory_tpl or bool(find_result_text_boxes(boxes, profile.victory_text, companions=profile.exit_text))
+        has_defeat = defeat_tpl or bool(find_result_text_boxes(boxes, profile.defeat_text, companions=profile.exit_text))
 
         outcome: Optional[str] = None
         if has_victory and not has_defeat:
@@ -334,7 +337,7 @@ class ScreenDetector:
             elapsed = (time.perf_counter() - started) * 1000.0
             perf_log(f"detect+outcome (template {tpl_kind.value})", elapsed)
             return tpl_kind, None
-        if tpl_kind == ScreenKind.RESULT:
+        if tpl_kind == ScreenKind.RESULT and not allow_ocr:
             elapsed = (time.perf_counter() - started) * 1000.0
             perf_log("detect+outcome (template result, no outcome)", elapsed)
             return ScreenKind.RESULT, None
@@ -352,6 +355,20 @@ class ScreenDetector:
         elapsed = (time.perf_counter() - started) * 1000.0
         perf_log(f"detect+outcome ({kind.value}/{outcome})", elapsed)
         return kind, outcome
+
+    def result_text_evidence(self, screenshot: np.ndarray) -> Dict[str, OCRBox]:
+        """Reuse the last explicit OCR probe; this method never starts OCR."""
+        if self._frame_boxes_ref is not screenshot:
+            return {}
+        profile = self.config.profile
+        evidence = {}
+        for name, text in (("victory", profile.victory_text),
+                           ("defeat", profile.defeat_text), ("exit", profile.exit_text)):
+            matches = find_result_text_boxes(self._frame_boxes, text, min_confidence=0.5,
+                                             companions=profile.exit_text if name != "exit" else "")
+            if matches:
+                evidence[name] = max(matches, key=lambda b: b.confidence)
+        return evidence
 
 
 def is_placeholder_power_region(region: Region) -> bool:
@@ -901,6 +918,15 @@ class ButtonFinder:
                 return find_text_boxes(self.ocr, image, keyword)
         return find_text_boxes(self.ocr, image, keyword)
 
+    def _find_ocr_boxes(self, image: np.ndarray, text: str, template_name: str) -> List[OCRBox]:
+        if template_name not in ("victory", "defeat"):
+            return find_text_boxes(self.ocr, image, text)
+        try:
+            return find_result_text_boxes(self.ocr.recognize(image), text, companions=self.config.profile.exit_text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("结算文案 OCR 失败: %s", exc)
+            return []
+
     def find(
         self,
         screenshot: np.ndarray,
@@ -938,7 +964,7 @@ class ButtonFinder:
                     scaled = scaler.scale_region(hint)
                     crop = crop_region(screenshot, scaled)
                     ocr_started = time.perf_counter()
-                    region_boxes = find_text_boxes(self.ocr, crop, fallback_text)
+                    region_boxes = self._find_ocr_boxes(crop, fallback_text, template_name)
                     if not region_boxes and self.engine is not None:
                         boxes_e, _ = self.engine.read_roi(
                             crop,
@@ -948,7 +974,7 @@ class ButtonFinder:
                             cache_key=f"btn:{template_name}:region",
                             force=False,
                         )
-                        region_boxes = [
+                        region_boxes = find_result_text_boxes(boxes_e, fallback_text, companions=self.config.profile.exit_text) if template_name in ("victory", "defeat") else [
                             b
                             for b in boxes_e
                             if b.confidence >= 0.3
@@ -985,7 +1011,7 @@ class ButtonFinder:
                 )
 
             full_started = time.perf_counter()
-            boxes = find_text_boxes(self.ocr, screenshot, fallback_text)
+            boxes = self._find_ocr_boxes(screenshot, fallback_text, template_name)
             perf_log(
                 f"Button {template_name} (full ocr)",
                 (time.perf_counter() - full_started) * 1000.0,
@@ -996,12 +1022,14 @@ class ButtonFinder:
                     b for b in boxes
                     if any(
                         matches_ocr_text(keyword, b.text)
-                        and (len(keyword) > 2 or len(b.text.strip()) <= len(keyword) + 1)
+                        and (len(normalize_ui_text(keyword)) > 2
+                             or len(normalize_ui_text(b.text)) <= len(normalize_ui_text(keyword)) + 1)
                         for keyword in keywords
                     )
                 ]
                 if boxes:
-                    exact = [b for b in boxes if b.text.strip() in keywords]
+                    normalized_keywords = {normalize_ui_text(k) for k in keywords}
+                    exact = [b for b in boxes if normalize_ui_text(b.text) in normalized_keywords]
                     # 标题=完整关键字、按钮=更短子串：优先更短标签，再靠下(按钮在标题下)，再置信度
                     if exact and len(exact) == len(boxes):
                         box = max(exact, key=lambda b: b.confidence)

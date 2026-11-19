@@ -313,6 +313,8 @@ class EasyOCRProvider(OCRProvider):
             raise OCRProviderError(f"easyocr 不可用: {exc}") from exc
 
         device = str(getattr(self.settings, "device", "auto") or "auto").lower()
+        if device in ("directml", "dml"):
+            raise OCRProviderError("EasyOCR 不支持 DirectML，请选择 rapidocr 后端")
         if device in ("cpu", "0", "false", "no"):
             gpu = False
         elif device in ("cuda", "gpu", "1", "true", "yes"):
@@ -418,6 +420,7 @@ class NullOCRProvider(OCRProvider):
     """Fails safe when no engine is installed - returns empty results."""
 
     name = "null"
+    device_label = "UNAVAILABLE"
 
     def __init__(self, settings: Optional[OcrSettings] = None) -> None:
         self.settings = settings or OcrSettings()
@@ -486,10 +489,17 @@ def _parse_paddle_result(result: object) -> List[OCRBox]:
     return boxes
 
 
+def _create_rapidocr_provider(settings: OcrSettings) -> OCRProvider:
+    from arena_auto.recognition.rapidocr_provider import RapidOCRProvider
+
+    return RapidOCRProvider(settings)
+
+
 _PROVIDER_FACTORIES = {
     "paddle": PaddleOCRProvider,
     "tesseract": TesseractOCRProvider,
     "easyocr": EasyOCRProvider,
+    "rapidocr": _create_rapidocr_provider,
 }
 
 
@@ -501,7 +511,8 @@ def create_base_ocr_provider(
     """Create a concrete OCR provider (no OcrEngine wrapper)."""
     settings = settings or OcrSettings()
     preferred = (settings.provider or "paddle").strip().lower()
-    order = [preferred] + [name for name in _PROVIDER_FACTORIES if name != preferred]
+    # Optional ONNX models are loaded only when explicitly selected.
+    order = [preferred] + [name for name in ("easyocr", "paddle", "tesseract") if name != preferred]
 
     errors: List[str] = []
     for name in order:
@@ -509,14 +520,19 @@ def create_base_ocr_provider(
         if factory is None:
             continue
         try:
-            provider = factory(settings)
+            actual_settings = settings
+            if name != preferred and preferred == "rapidocr":
+                from dataclasses import replace
+
+                actual_settings = replace(settings, device="cpu")
+            provider = factory(actual_settings)
             if name != preferred:
                 logger.warning("OCR 回退到引擎: %s", name)
             return provider
         except OCRProviderError as exc:
             errors.append(f"{name}: {exc}")
             logger.warning("OCR 引擎不可用 (%s): %s", name, exc)
-            if not allow_fallback:
+            if not allow_fallback or (preferred == "rapidocr" and not settings.gpu_fallback_to_cpu):
                 break
 
     if allow_null:
@@ -551,9 +567,13 @@ def create_ocr_provider(
 def matches_ocr_text(keyword: str, text: str) -> bool:
     """Match any configured alternative, ignoring empty OCR output."""
     from arena_auto.models.config import split_ocr_text
+    from arena_auto.recognition.result_text import normalize_ui_text
 
-    text = text.strip()
-    return bool(text) and any(kw in text or text in kw for kw in split_ocr_text(keyword))
+    text = normalize_ui_text(text)
+    return bool(text) and any(
+        normalize_ui_text(kw) in text or text in normalize_ui_text(kw)
+        for kw in split_ocr_text(keyword)
+    )
 
 
 def find_text_boxes(

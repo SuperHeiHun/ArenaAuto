@@ -12,7 +12,8 @@ from arena_auto.models.config import AppConfig
 from arena_auto.models.recognition import OCRBox
 from arena_auto.models.state import ScreenKind
 from arena_auto.recognition.detector import ScreenDetector
-from arena_auto.recognition.ocr import OCRProvider, preprocess_for_ocr
+from arena_auto.recognition.ocr import OCRProvider
+from arena_auto.recognition.ocr_pipeline import recognize_frame
 
 logger = logging.getLogger(__name__)
 
@@ -33,25 +34,13 @@ class ScreenAnalyzer:
     def __init__(self, ocr: OCRProvider, config: AppConfig) -> None:
         self.ocr = ocr
         self.config = config
+        self.input_mode = "原始截图"
 
     def recognize(self, screenshot: np.ndarray) -> List[OCRBox]:
-        if screenshot is None or screenshot.size == 0:
-            return []
-        boxes: List[OCRBox] = []
-        try:
-            boxes = self.ocr.recognize(screenshot)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[CALIBRATION] 全屏 OCR 失败: %s", exc)
-            boxes = []
-        if not boxes:
-            try:
-                processed = preprocess_for_ocr(screenshot, self.config.ocr)
-                boxes = self.ocr.recognize(processed)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[CALIBRATION] 预处理 OCR 失败: %s", exc)
-                boxes = []
-        logger.info("[CALIBRATION] OCR detected %s text regions", len(boxes))
-        return boxes
+        result = recognize_frame(self.ocr, screenshot, self.config.ocr)
+        self.input_mode = result.input_mode
+        logger.info("[CALIBRATION] OCR detected %s text regions (%s)", len(result.boxes), result.input_mode)
+        return result.boxes
 
     def detect_screen(
         self, screenshot: np.ndarray, boxes: List[OCRBox]

@@ -14,7 +14,7 @@ from arena_auto.logging.logger import setup_logging
 logger = logging.getLogger(__name__)
 
 
-def main() -> int:
+def main(*, ocr_provider: Optional[str] = None, ocr_device: Optional[str] = None) -> int:
     """Entry point used by main.py and python -m arena_auto."""
     try:
         config_manager = ConfigManager.load_or_create()
@@ -39,6 +39,12 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             print(f"错误: {exc}", file=sys.stderr)
         return 1
+
+    # Dedicated launcher overrides only the current session until the user saves.
+    if ocr_provider is not None:
+        config_manager.config.ocr.provider = ocr_provider
+    if ocr_device is not None:
+        config_manager.config.ocr.device = ocr_device
 
     setup_logging(performance=bool(getattr(config_manager.config.logging, "performance", False)))
 

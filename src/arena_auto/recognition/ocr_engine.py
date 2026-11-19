@@ -186,7 +186,7 @@ class OcrEngine(OCRProvider):
     _shared_lock = threading.Lock()
     # Shared low-level provider factory result (EasyOCR Reader is process-wide).
     _shared_provider: Optional[OCRProvider] = None
-    _shared_key: Optional[Tuple[str, str, str]] = None
+    _shared_key: Optional[Tuple[str, str, str, int, bool]] = None
 
     def __init__(
         self,
@@ -210,7 +210,8 @@ class OcrEngine(OCRProvider):
             getattr(self.settings, "cache_difference_threshold", 3.0)
         )
         self._ready = provider is not None
-        self._device_label = str(getattr(self.settings, "device", "auto") or "auto")
+        label = getattr(provider, "device_label", None)
+        self._device_label = label if isinstance(label, str) else "CPU" if provider is not None else "initializing"
         self.base_factory: Optional[Callable[[], OCRProvider]] = None
         # Cooperative cancel: return immediately once stop_event is set.
         self._cancel_check: Optional[Callable[[], bool]] = None
@@ -235,9 +236,10 @@ class OcrEngine(OCRProvider):
         return OcrEngine._shared_provider is not None
 
     @classmethod
-    def shared_provider_key(cls, settings: OcrSettings) -> Tuple[str, str, str]:
+    def shared_provider_key(cls, settings: OcrSettings) -> Tuple[str, str, str, int, bool]:
         device = str(getattr(settings, "device", "auto") or "auto").lower()
-        return (str(settings.provider), str(settings.lang), device)
+        return (str(settings.provider).lower(), str(settings.lang), device,
+                settings.gpu_device_id, settings.gpu_fallback_to_cpu)
 
     @classmethod
     def create_shared(cls, settings: Optional[OcrSettings] = None) -> "OcrEngine":
@@ -276,6 +278,8 @@ class OcrEngine(OCRProvider):
             else:
                 self._provider = self._make_base_provider()
             self._ready = True
+            label = getattr(self._provider, "device_label", None)
+            self._device_label = label if isinstance(label, str) else "CPU"
             elapsed = (time.perf_counter() - started) * 1000.0
             perf_log(f"OCR init ({getattr(self._provider, 'name', '?')})", elapsed)
             logger.info(
@@ -312,6 +316,9 @@ class OcrEngine(OCRProvider):
         try:
             with self._call_lock:
                 boxes = self._call_provider(provider, image, kwargs)
+            label = getattr(provider, "device_label", None)
+            if isinstance(label, str):
+                self._device_label = label
             elapsed = (time.perf_counter() - started) * 1000.0
             if self._timeout_ms and elapsed > self._timeout_ms:
                 timeout = True
@@ -405,10 +412,17 @@ class OcrEngine(OCRProvider):
         started = time.perf_counter()
         try:
             with self._call_lock:
-                boxes = self._call_provider(self.provider, work, kwargs)
+                provider = self.provider
+                if allowlist and getattr(provider, "prefers_single_line", False) is True:
+                    boxes = provider.recognize_line(work)
+                else:
+                    boxes = self._call_provider(provider, work, kwargs)
                 # Fallback: allowlist may yield nothing on odd fonts — retry raw.
                 if not boxes and allowlist:
                     boxes = self._call_provider(self.provider, work, {})
+                label = getattr(self.provider, "device_label", None)
+                if isinstance(label, str):
+                    self._device_label = label
         except Exception as exc:  # noqa: BLE001
             elapsed = (time.perf_counter() - started) * 1000.0
             self.monitor.record(elapsed, ok=False)

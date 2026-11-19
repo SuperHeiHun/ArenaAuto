@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -26,7 +26,7 @@ from arena_auto.exceptions import (
     StoppedError,
 )
 from arena_auto.models.config import AppConfig
-from arena_auto.models.recognition import ChallengeCount, Opponent
+from arena_auto.models.recognition import ChallengeCount, Opponent, OCRBox
 from arena_auto.models.state import AutomationState, ScreenKind, SessionStatistics
 from arena_auto.paths import get_data_dir
 from arena_auto.recognition.detector import (
@@ -37,7 +37,8 @@ from arena_auto.recognition.detector import (
 )
 from arena_auto.recognition.ocr import OCRProvider, create_ocr_provider
 from arena_auto.recognition.auto_targeting import AutoTargeting
-from arena_auto.recognition.screen import CoordinateScaler
+from arena_auto.recognition.ocr_engine import OcrEngine
+from arena_auto.recognition.screen import CoordinateScaler, crop_region
 from arena_auto.recognition.template import TemplateRecognizer
 
 logger = logging.getLogger(__name__)
@@ -70,12 +71,14 @@ class _RuntimeContext:
     recovery_attempts: int = 0
     exit_attempts: int = 0
     opponent_wait_started: float = 0.0
+    opponent_wait_snapshot_saved: bool = False
     battle_started_at: float = 0.0
     last_log_banner: str = ""
     pending_purchase: bool = False
     # WAIT_RESULT: consecutive template-only misses (for optional OCR fallback)
     wait_result_template_fails: int = 0
     auto_selection_attempts: int = 0
+    result_ocr_last_at: float = 0.0
 
 
 class AutomationController:
@@ -111,6 +114,7 @@ class AutomationController:
         )
         self.buttons = ButtonFinder(self.templates, self.ocr, self.config, self.debug)
         self.auto_targeting = AutoTargeting(self.ocr, self.config)
+        self._ocr_signature = OcrEngine.shared_provider_key(self.config.ocr)
 
         self.sm = StateMachine(
             initial=AutomationState.IDLE,
@@ -164,6 +168,17 @@ class AutomationController:
         self.templates.set_entries(self.config.templates)
         self.scaler.reference_width = self.config.screen.reference_width
         self.scaler.reference_height = self.config.screen.reference_height
+        signature = OcrEngine.shared_provider_key(self.config.ocr)
+        if signature != self._ocr_signature:
+            # Rebuild lazily: changing dropdowns must not retain an old CPU Reader.
+            self.ocr = create_ocr_provider(self.config.ocr)
+            self.detector = ScreenDetector(self.ocr, self.config, self.templates, self.scaler)
+            self.power_reader = PowerReader(self.ocr, self.config, self.config.recognition, self.scaler, self.debug)
+            self.challenge_reader = ChallengeCountReader(self.ocr, self.config, self.scaler, self.debug)
+            self.buttons = ButtonFinder(self.templates, self.ocr, self.config, self.debug)
+            self.auto_targeting = AutoTargeting(self.ocr, self.config)
+            self._ocr_signature = signature
+            self._install_ocr_cancel()
         self.detector.config = self.config
         self.power_reader.config = self.config
         self.power_reader.recognition = self.config.recognition
@@ -221,7 +236,8 @@ class AutomationController:
                 self.ocr.ensure_ready()  # type: ignore[attr-defined]
                 name = getattr(self.ocr, "name", "ocr")
                 provider = getattr(getattr(self.ocr, "_provider", None), "name", name)
-                self._log("INFO", f"OCR Ready ({provider})")
+                device = getattr(getattr(self.ocr, "_provider", None), "device_label", "CPU")
+                self._log("INFO", f"OCR Ready ({provider}) device={device}")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("OCR 初始化失败: %s", exc)
                 self._log("WARNING", f"OCR 初始化失败: {exc}")
@@ -230,7 +246,9 @@ class AutomationController:
         if missing:
             self._log(
                 "WARNING",
-                f"缺少模板文件: {', '.join(missing)}。请进入调试工具创建模板",
+                (f"自动初始化：以下可选模板缺失，将使用 OCR: {', '.join(missing)}"
+                 if self.config.automation.auto_targeting else
+                 f"缺少模板文件: {', '.join(missing)}。可通过半自动配置生成模板"),
             )
 
         try:
@@ -471,12 +489,13 @@ class AutomationController:
 
         try:
             if automatic:
-                self._log("INFO", "自动选点：重新识别完整卡片并校验战力，不使用已保存坐标")
+                self._log("INFO", "自动初始化：共用半自动配置 OCR（原图优先，空结果预处理重试），战力仍多帧复核")
                 opponents, selected = self.auto_targeting.select(factory, threshold, self.stop_event)
                 if self.auto_targeting.last_image is not None:
                     overlay = self.auto_targeting.draw(self.auto_targeting.last_image)
                     self.debug.save(overlay, category="arena", tag="auto_targeting")
                     self._emit_screenshot(overlay)
+                    self._log("INFO", f"布局定位输入: {self.auto_targeting.input_mode}")
             else:
                 # Short-circuit manual/configured mode preserves the existing path.
                 opponents, selected = self.power_reader.read_until_at_or_below(
@@ -538,10 +557,15 @@ class AutomationController:
             self._log("ERROR", "点击前截图与识别时的卡片不一致（可能已刷新），取消点击")
             self.sm.transition(AutomationState.STOPPED)
             return
+        if automatic:
+            card = next((c for c in self.auto_targeting.last_cards if c.opponent.id == selected.id), None)
+            if card is not None:
+                self._log("INFO", f"对手点击区域：{card.target_source} card={card.region} point=({x},{y})")
         self._safe_tap(x, y, label=f"对手 #{selected.id}")
         if automatic:
             self.ctx.auto_selection_attempts += 1
         self.ctx.opponent_wait_started = time.monotonic()
+        self.ctx.opponent_wait_snapshot_saved = False
         if self.ctx.pending_purchase:
             self._log("INFO", "已点击对手，等待购买弹窗")
             self.sm.transition(AutomationState.BUY_CHALLENGE)
@@ -566,6 +590,9 @@ class AutomationController:
             raise StoppedError("用户停止")
         image = self._shot()
         kind = self.detector.detect(image)
+        if self.config.automation.auto_targeting and not self.ctx.opponent_wait_snapshot_saved:
+            self.debug.save(image, category="prepare", tag=f"after_opponent_{self.ctx.auto_selection_attempts}_{kind.value}")
+            self.ctx.opponent_wait_snapshot_saved = True
         if kind == ScreenKind.PREPARE:
             self._log("INFO", "当前页面：PREPARE")
             self.ctx.auto_selection_attempts = 0
@@ -576,7 +603,12 @@ class AutomationController:
             self.sm.transition(AutomationState.BUY_CHALLENGE)
             return
         if kind == ScreenKind.ARENA:
-            # click may have failed
+            # A single early frame is not enough to declare the tap ineffective.
+            if self.config.automation.auto_targeting and self.sm.time_in_state() < min(3.0, timeout * 0.25):
+                self._log("INFO", "点击后暂仍在竞技场，等待页面切换，不重复点击")
+                return
+            if self.config.automation.auto_targeting:
+                self.debug.save(image, category="prepare", tag="opponent_click_unchanged")
             self._log("WARNING", "仍在竞技场，重新选择对手")
             self.sm.transition(AutomationState.ARENA)
             return
@@ -591,6 +623,7 @@ class AutomationController:
         if result.found:
             self._log("INFO", "检测到「去获胜」")
             self.ctx.auto_selection_attempts = 0
+            self.ctx.result_ocr_last_at = 0.0
             cx, cy = result.center
             self._safe_tap(cx, cy, label="去获胜")
             self.ctx.battle_started_at = time.monotonic()
@@ -605,11 +638,7 @@ class AutomationController:
         self.sm.transition(AutomationState.WAIT_RESULT)
 
     def _state_wait_result(self) -> None:
-        """Normal path: ADB screenshot + OpenCV templates only (OCR = 0).
-
-        EasyOCR / full-screen OCR is forbidden unless debug.allow_ocr_fallback
-        is true AND templates failed N consecutive polls AND state looks abnormal.
-        """
+        """Template first; auto mode has a rate-limited OCR safety fallback."""
         if self.stop_event.is_set():
             raise StoppedError("用户停止")
         battle_cfg = self.config.battle
@@ -618,11 +647,11 @@ class AutomationController:
         elapsed = time.monotonic() - self.ctx.battle_started_at
         if elapsed > battle_cfg.max_duration:
             self._log("ERROR", "战斗超时")
-            self.sm.transition(AutomationState.RECOVERY)
+            self.sm.transition(AutomationState.STOPPED if self.config.automation.auto_targeting else AutomationState.RECOVERY)
             return
 
         interval = max(0.5, battle_cfg.poll_interval)
-        self._log("INFO", "战斗进行中")
+        self._log("INFO", "等待战斗结束（正在检查结算画面）")
         if self._wait(interval):
             raise StoppedError("用户停止")
         if self.stop_event.is_set():
@@ -659,9 +688,11 @@ class AutomationController:
         # Still in battle (or unknown chrome): no OCR on normal path.
         self.ctx.wait_result_template_fails += 1
 
-        # --- Optional OCR fallback (explicit opt-in only) ---
+        # Auto mode must not require pre-calibrated result templates. Manual
+        # mode keeps the prior explicit debug opt-in and abnormal-state gate.
         debug_cfg = self.config.debug
-        if not getattr(debug_cfg, "allow_ocr_fallback", False):
+        automatic = self.config.automation.auto_targeting
+        if not automatic and not getattr(debug_cfg, "allow_ocr_fallback", False):
             return
         min_fails = max(1, int(getattr(debug_cfg, "ocr_fallback_min_failures", 3)))
         if self.ctx.wait_result_template_fails < min_fails:
@@ -671,17 +702,13 @@ class AutomationController:
             elapsed > min(30.0, battle_cfg.max_duration * 0.25)
             or self.ctx.wait_result_template_fails >= min_fails * 2
         )
-        if not abnormal:
+        if not automatic and not abnormal:
             return
 
-        self._log(
-            "WARNING",
-            f"模板连续失败 {self.ctx.wait_result_template_fails} 次且状态异常，"
-            f"启用 OCR 兜底（allow_ocr_fallback）",
-        )
-        kind, ocr_outcome = self.detector.detect_screen_and_outcome(
-            image, allow_ocr=True
-        )
+        probe = self._probe_result_ocr(image)
+        if probe is None:
+            return
+        kind, ocr_outcome = probe
         if kind == ScreenKind.RESULT or ocr_outcome is not None:
             self.ctx.outcome = ocr_outcome
             self.ctx.wait_result_template_fails = 0
@@ -698,8 +725,40 @@ class AutomationController:
             self.sm.transition(AutomationState.PREPARE)
             return
 
+    def _probe_result_ocr(self, image: np.ndarray) -> Optional[Tuple[ScreenKind, Optional[str]]]:
+        """At most one OCR probe per cooldown; reuses boxes for live templates."""
+        now = time.monotonic()
+        if self.ctx.result_ocr_last_at > 0 and now - self.ctx.result_ocr_last_at < self.config.battle.result_ocr_interval:
+            return None
+        if self.stop_event.is_set():
+            raise StoppedError("用户停止")
+        self._log("WARNING", "结算模板未命中，执行限频 OCR 兜底（识别失败不会猜测胜负）")
+        kind, outcome = self.detector.detect_screen_and_outcome(image, allow_ocr=True)
+        self.ctx.result_ocr_last_at = time.monotonic()  # Cooldown starts after slow OCR finishes.
+        if self.stop_event.is_set():
+            raise StoppedError("用户停止")
+        if self.config.automation.auto_targeting and kind == ScreenKind.RESULT:
+            evidence = self.detector.result_text_evidence(image)
+            if isinstance(evidence, dict) and "exit" in evidence:
+                result_names = [name for name in ("victory", "defeat") if name in evidence]
+                # Learn only when both the distinct outcome and exit are observed.
+                expected = "victory" if outcome == "WIN" else "defeat" if outcome == "LOSE" else ""
+                if result_names == [expected]:
+                    for name in (expected, "exit"):
+                        box = evidence[name]
+                        if not isinstance(box, OCRBox):
+                            continue
+                        try:
+                            crop = crop_region(image, box.bbox)
+                            if self.templates.register_image(name, crop):
+                                self._log("INFO", f"已缓存当前结算 {name} 模板（仅内存，不改文件或坐标）")
+                        except ValueError:
+                            pass
+        self.debug.save(image, category="battle", tag="result_ocr_probe")
+        return kind, outcome
+
     def _state_result(self) -> None:
-        """Already know RESULT: template outcome + find exit only (no detect(), no full OCR)."""
+        """Known RESULT: template first; auto mode can confirm an unknown outcome."""
         if self.stop_event.is_set():
             raise StoppedError("用户停止")
         image = self._shot()
@@ -713,12 +772,23 @@ class AutomationController:
 
         exit_visible = self.templates.find(image, "exit").found
 
+        if outcome is None and self.config.automation.auto_targeting:
+            probe = self._probe_result_ocr(image)
+            if probe is not None:
+                kind, detected_outcome = probe
+                if kind == ScreenKind.RESULT:
+                    outcome = detected_outcome
+                    exit_visible = exit_visible or self.templates.find(image, "exit").found
+                    evidence = self.detector.result_text_evidence(image)
+                    if isinstance(evidence, dict) and isinstance(evidence.get("exit"), OCRBox):
+                        exit_visible = True
+
         if outcome is None and not exit_visible:
             # Wait for victory/defeat/exit templates — never detector.detect() / full OCR.
             if self.sm.has_timed_out(self.config.timeouts.result):
                 self._log(
                     "ERROR",
-                    "无法识别结算结果（模板未命中，OCR 兜底未开启）",
+                    "结算识别超时：没有可靠的胜负或退出证据",
                 )
                 self.statistics.recognition_failures += 1
                 self._emit_statistics()
@@ -726,12 +796,11 @@ class AutomationController:
                     outcome = self.detector.detect_outcome(image)
                     exit_visible = self.buttons.find_exit(image, full_ocr=False).found
                 if outcome is None and not exit_visible:
-                    self.sm.transition(AutomationState.RECOVERY)
+                    self.sm.transition(AutomationState.STOPPED if self.config.automation.auto_targeting else AutomationState.RECOVERY)
                     return
             else:
                 if self._wait(1.0):
                     raise StoppedError("用户停止")
-                self.sm.reenter()
                 return
 
         if outcome is None and exit_visible:
@@ -765,7 +834,9 @@ class AutomationController:
             raise StoppedError("用户停止")
 
         # Only find the exit button (template first; no detector.detect / full OCR).
-        exit_result = self.buttons.find_exit(image, full_ocr=False)
+        exit_result = self.buttons.find_exit(
+            image, full_ocr=self.config.automation.auto_targeting or self.config.debug.allow_ocr_fallback
+        )
         if exit_result.found:
             self._log("INFO", "点击「退出」")
             cx, cy = exit_result.center

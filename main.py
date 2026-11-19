@@ -13,6 +13,10 @@ if str(SRC) not in sys.path:
 
 
 def run() -> int:
+    if "--self-test" in sys.argv[1:]:
+        from arena_auto.runtime_check import main as check_runtime
+
+        return check_runtime(sys.argv[1:])
     from arena_auto.app import main
 
     return main()

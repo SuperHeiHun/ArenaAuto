@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QThread, Qt, QTimer
+from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
+    QScrollArea,
     QSplitter,
     QStatusBar,
     QTabWidget,
@@ -62,6 +63,8 @@ logger = logging.getLogger(__name__)
 class MainWindow(QMainWindow):
     """Main application window - all heavy work runs on worker threads."""
 
+    log_received = Signal(str, str)
+
     def __init__(self, config_manager: ConfigManager, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("ArenaAuto — 胜利者的竞技场自动化")
@@ -89,11 +92,12 @@ class MainWindow(QMainWindow):
 
         missing = self.config_manager.missing_templates()
         if missing:
-            self._append_log(
-                "WARNING",
-                f"缺少模板文件: {', '.join(missing)}。请进入调试工具创建模板",
-            )
-            self.statusBar().showMessage("缺少模板文件，请打开调试工具创建", 8000)
+            if self.config.automation.auto_targeting:
+                self._append_log("INFO", "自动初始化已开启：缺失模板将使用 OCR 识别，无需先标定位置")
+                self.statusBar().showMessage("自动初始化就绪，请在设备上打开竞技场页面", 8000)
+            else:
+                self._append_log("WARNING", f"缺少模板文件: {', '.join(missing)}。可通过半自动配置生成模板")
+                self.statusBar().showMessage("部分模板缺失，可通过半自动配置生成", 8000)
 
     # --------------------------------------------------------------------- ui
     def _build_ui(self) -> None:
@@ -138,8 +142,8 @@ class MainWindow(QMainWindow):
         self.dry_run_check = QCheckBox("测试模式（不真实点击）")
         param_form.addRow(self.dry_run_check)
 
-        self.auto_target_check = QCheckBox("自动选对手（试验，无需坐标）")
-        self.auto_target_check.setToolTip("识别完整可见卡片和头像；不使用保存的对手/挑战次数坐标。建议先在开发/调试中测试自动选点。暂不自动滚动。")
+        self.auto_target_check = QCheckBox("自动初始化")
+        self.auto_target_check.setToolTip("无需预先配置坐标，自动识别完整对手卡片、战力与挑战次数；点击规则与半自动配置一致。缺失模板时使用 OCR；无法可靠识别则安全停止。暂不自动滚动。")
         param_form.addRow(self.auto_target_check)
 
         self.purchase_check = QCheckBox("自动购买挑战次数")
@@ -150,8 +154,19 @@ class MainWindow(QMainWindow):
         param_form.addRow(self.debug_check)
 
         self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["easyocr", "paddle", "tesseract"])
+        self.provider_combo.addItems(["easyocr", "rapidocr", "paddle", "tesseract"])
         param_form.addRow("OCR 引擎", self.provider_combo)
+
+        self.ocr_device_combo = QComboBox()
+        self.ocr_device_combo.addItems(["auto", "cpu", "directml", "cuda"])
+        self.ocr_device_combo.setToolTip("AMD/Intel GPU：rapidocr + directml；NVIDIA CUDA：easyocr + cuda。auto 自动选择可用设备。")
+        param_form.addRow("OCR 设备", self.ocr_device_combo)
+        self.gpu_device_spin = QSpinBox()
+        self.gpu_device_spin.setRange(0, 31)
+        self.gpu_device_spin.setToolTip("DirectML 的 DXGI 显卡编号，通常为 0；不是 ADB 设备编号。")
+        param_form.addRow("GPU 编号", self.gpu_device_spin)
+        self.gpu_fallback_check = QCheckBox("GPU 不可用时回退 CPU")
+        param_form.addRow(self.gpu_fallback_check)
 
         self.ocr_scale_spin = QSpinBox()
         self.ocr_scale_spin.setRange(1, 6)
@@ -177,7 +192,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(btn_row)
 
         cal_row = QHBoxLayout()
-        self.auto_cfg_btn = QPushButton("自动配置")
+        self.auto_cfg_btn = QPushButton("半自动配置")
         self.auto_cfg_btn.clicked.connect(lambda: self.open_calibration(False))
         self.recalib_btn = QPushButton("重新标定")
         self.recalib_btn.clicked.connect(lambda: self.open_calibration(True))
@@ -227,7 +242,13 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(stats_box)
 
         left_layout.addStretch(1)
-        splitter.addWidget(left)
+        # Optional OCR device settings must not push Start/Stop off small screens.
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QScrollArea.NoFrame)
+        left_scroll.setWidget(left)
+        left_scroll.setMinimumWidth(340)
+        splitter.addWidget(left_scroll)
 
         # ----- right column: tabs
         right = QTabWidget()
@@ -329,10 +350,12 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- logging
     def _attach_log_handler(self) -> None:
         root = logging.getLogger("arena_auto")
+        self.log_received.connect(self._append_log, Qt.QueuedConnection)
 
         def _emit(level: str, message: str) -> None:
-            # marshal to GUI thread
-            QTimer.singleShot(0, lambda: self._append_log(level, message))
+            # A timer created on a busy OCR worker only fires after it stops.
+            # A queued QObject signal delivers directly to the GUI event loop.
+            self.log_received.emit(level, message)
 
         handler = CallbackHandler(_emit, level=logging.DEBUG)
         handler.setLevel(logging.DEBUG)
@@ -367,6 +390,10 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.provider_combo.setCurrentIndex(idx)
         self.ocr_scale_spin.setValue(cfg.ocr.scale)
+        device = "directml" if cfg.ocr.device == "dml" else cfg.ocr.device
+        self.ocr_device_combo.setCurrentText(device)
+        self.gpu_device_spin.setValue(cfg.ocr.gpu_device_id)
+        self.gpu_fallback_check.setChecked(cfg.ocr.gpu_fallback_to_cpu)
 
     def _apply_form_to_config(self) -> bool:
         cfg = self.config
@@ -378,6 +405,14 @@ class MainWindow(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "配置错误", "power_threshold 必须是数字")
             return False
+        provider = self.provider_combo.currentText()
+        device = self.ocr_device_combo.currentText()
+        if device == "directml" and provider != "rapidocr":
+            QMessageBox.warning(self, "OCR 设备", "DirectML 请选择 rapidocr 引擎；EasyOCR 的 GPU 模式使用 CUDA。")
+            return False
+        if provider == "rapidocr" and device == "cuda":
+            QMessageBox.warning(self, "OCR 设备", "rapidocr 请使用 directml、auto 或 cpu；CUDA 请选 easyocr。")
+            return False
         cfg.automation.power_threshold = threshold
         cfg.battle.poll_interval = float(self.poll_spin.value())
         cfg.automation.poll_interval = float(self.poll_spin.value())
@@ -388,6 +423,9 @@ class MainWindow(QMainWindow):
         cfg.debug.enabled = self.debug_check.isChecked()
         cfg.ocr.provider = self.provider_combo.currentText()
         cfg.ocr.scale = int(self.ocr_scale_spin.value())
+        cfg.ocr.device = self.ocr_device_combo.currentText()
+        cfg.ocr.gpu_device_id = self.gpu_device_spin.value()
+        cfg.ocr.gpu_fallback_to_cpu = self.gpu_fallback_check.isChecked()
 
         serial = self.device_combo.currentText().strip()
         if serial == "未检测到 Android 设备":
@@ -444,11 +482,14 @@ class MainWindow(QMainWindow):
 
     def open_calibration(self, recalibrate: bool = False) -> None:
         if self._automation_running():
-            QMessageBox.warning(self, "自动配置", "自动化运行中，请先停止")
+            QMessageBox.warning(self, "半自动配置", "自动化运行中，请先停止")
             return
         if not self._apply_form_to_config():
             return
         ocr = self._controller.ocr if self._controller is not None else None
+        if self._controller is not None:
+            self._controller.reload_config()
+            ocr = self._controller.ocr
         wizard = CalibrationWizard(
             config_manager=self.config_manager,
             adb=self.adb,
@@ -466,8 +507,8 @@ class MainWindow(QMainWindow):
             self.debug_recorder = DebugRecorder(self.config.debug)
             if self._controller is not None:
                 self._controller.reload_config()
-            self._append_log("INFO", f"自动配置已保存: {wizard.saved_path}")
-            self.statusBar().showMessage(f"自动配置已保存: {wizard.saved_path}", 6000)
+            self._append_log("INFO", f"半自动配置已保存: {wizard.saved_path}")
+            self.statusBar().showMessage(f"半自动配置已保存: {wizard.saved_path}", 6000)
 
     def test_current_config(self) -> None:
         if self._automation_running():
@@ -642,20 +683,16 @@ class MainWindow(QMainWindow):
     def start_automation(self) -> None:
         if self._automation_thread is not None and self._automation_thread.isRunning():
             return
+        if any(worker is not None and worker.isRunning() for worker in
+               (self._test_worker, self._calibration_worker, self._shot_worker, self._device_worker)):
+            QMessageBox.warning(self, "开始运行", "设备操作或识别测试正在执行，请等待完成")
+            return
         controller = self._ensure_controller()
         if controller is None:
             return
 
-        missing = self.config_manager.missing_templates()
-        if missing:
-            answer = QMessageBox.question(
-                self,
-                "缺少模板",
-                f"缺少模板文件: {', '.join(missing)}\n\n"
-                "部分按钮可能只能依赖 OCR fallback。仍要启动吗？",
-            )
-            if answer != QMessageBox.Yes:
-                return
+        if not self._confirm_automation_start():
+            return
 
         controller.reset_stop()
         self._automation_worker = AutomationWorker(controller)
@@ -678,11 +715,40 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.save_cfg_btn.setEnabled(False)
         self.auto_target_check.setEnabled(False)
+        for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.gpu_fallback_check):
+            control.setEnabled(False)
         # OCR loads on the automation worker thread — keep the GUI free.
         self.statusBar().showMessage("OCR 初始化中...")
         self.ocr_status_label.setText("OCR: 初始化中...")
         self._append_log("INFO", "开始运行（OCR 于后台线程初始化）")
         self._automation_thread.start()
+
+    def _confirm_automation_start(self) -> bool:
+        if self.config.automation.auto_targeting:
+            mode = "测试模式：只记录操作，不会真实点击。" if self.config.automation.dry_run else "实际运行：将按识别结果执行点击。"
+            purchase = (f"已开启，上限 {self.config.purchase.max_per_session} 次/会话"
+                        if self.config.purchase.enabled else "已关闭")
+            answer = QMessageBox.question(
+                self, "开始自动初始化",
+                "请先在设备上打开竞技场的选择对手页面。\n\n"
+                "程序将自动识别战力、挑战次数与点击位置，无需先手动标定。"
+                "未找到模板时会使用 OCR，不必先执行半自动配置。\n"
+                "识别不可靠时安全停止，不会猜测坐标或胜负。\n\n"
+                f"战力阈值：{self.config.automation.power_threshold:,}\n"
+                f"自动购买：{purchase}\n{mode}\n\n是否开始？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            return answer == QMessageBox.Yes
+        missing = self.config_manager.missing_templates()
+        if missing:
+            answer = QMessageBox.question(
+                self,
+                "缺少模板",
+                f"缺少模板文件: {', '.join(missing)}\n\n"
+                "可先使用半自动配置生成模板；部分按钮将依赖 OCR。仍要启动吗？",
+            )
+            return answer == QMessageBox.Yes
+        return True
 
     def stop_automation(self) -> None:
         if self._automation_worker is not None:
@@ -696,6 +762,8 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.save_cfg_btn.setEnabled(True)
         self.auto_target_check.setEnabled(True)
+        for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.gpu_fallback_check):
+            control.setEnabled(True)
         self.statusBar().showMessage("已停止")
         if self._automation_thread is not None:
             self._automation_thread.quit()
@@ -720,6 +788,9 @@ class MainWindow(QMainWindow):
                 self._controller._save_statistics()
         except Exception:  # noqa: BLE001
             pass
+        if hasattr(self, "_log_handler"):
+            logging.getLogger("arena_auto").removeHandler(self._log_handler)
+            self._log_handler.close()
         event.accept()
 
     # ---------------------------------------------------------------- signals
@@ -767,7 +838,10 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- screenshot
     def refresh_screenshot(self) -> None:
-        if not self._apply_form_to_config():
+        if self._shot_worker is not None and self._shot_worker.isRunning():
+            return
+        # Preview must not reload form/config into a running controller.
+        if not self._automation_running() and not self._apply_form_to_config():
             return
         self._shot_worker = ScreenshotWorker(self.adb, self)
         self._shot_worker.captured.connect(
@@ -798,10 +872,10 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ debug tools
     def run_debug_test(self, test_name: str) -> None:
-        if test_name == "auto_targeting" and (
+        if (
             self._automation_running() or (self._test_worker is not None and self._test_worker.isRunning())
         ):
-            QMessageBox.warning(self, "测试自动选点", "请先停止自动化或等待识别测试完成")
+            QMessageBox.warning(self, "识别测试", "请先停止自动化或等待识别测试完成，避免 OCR 争用和配置重载")
             return
         if not self._apply_form_to_config():
             return
@@ -825,7 +899,7 @@ class MainWindow(QMainWindow):
         elif name == "auto_targeting":
             cards = payload.get("cards") or []
             lines = [f"#{c['id']} {c['identity']} 战力={c['power']} 点击={c['click']}（{c['source']}）" for c in cards]
-            self.debug_payload_label.setText("自动选点（仅分析，不点击）: " + ("; ".join(lines) if lines else "未找到可靠的完整卡片，不会使用旧坐标"))
+            self.debug_payload_label.setText("自动选点（布局预览，不点击；战力为整图初读，运行时复核数字 ROI）: " + ("; ".join(lines) if lines else "未找到可靠的完整卡片，不会使用旧坐标"))
         elif name == "arena":
             self.debug_payload_label.setText(f"页面识别: {payload.get('screen')}")
         elif name == "powers":
@@ -859,6 +933,9 @@ class MainWindow(QMainWindow):
                 self.debug_payload_label.setText(f"{name}: 未找到 (conf={conf_text})")
 
     def capture_template(self) -> None:
+        if self._automation_running():
+            QMessageBox.warning(self, "创建模板", "请先停止自动化，再创建模板")
+            return
         if not self._apply_form_to_config():
             return
         try:

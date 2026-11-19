@@ -1,4 +1,4 @@
-"""Experimental coordinate-free targeting of visible, complete arena cards.
+"""Coordinate-free targeting of visible, complete arena cards.
 
 Pure screenshot/OCR analysis: never taps, scrolls, saves user configuration, or
 falls back to old coordinates. Currently supports the light horizontal cards.
@@ -6,6 +6,7 @@ falls back to old coordinates. Currently supports the light horizontal cards.
 
 from __future__ import annotations
 
+import logging
 import statistics
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
@@ -18,7 +19,27 @@ from arena_auto.calibration.opponent_detector import OpponentDetector
 from arena_auto.exceptions import OCRFailedError, StoppedError
 from arena_auto.models.config import AppConfig, split_ocr_text
 from arena_auto.models.recognition import ChallengeCount, OCRBox, Opponent, Region
-from arena_auto.recognition.ocr import OCRProvider, parse_challenge_count
+from arena_auto.recognition.ocr import OCRProvider, parse_challenge_count, parse_power, preprocess_for_ocr
+from arena_auto.recognition.ocr_engine import OcrEngine
+from arena_auto.recognition.ocr_pipeline import recognize_frame
+from arena_auto.recognition.screen import crop_region
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PowerHeader:
+    box: OCRBox
+    value: Optional[int] = None
+    number_region: Optional[Region] = None
+
+    @property
+    def cy(self):
+        return self.box.bbox[1] + self.box.bbox[3] / 2
+
+    @property
+    def bbox(self):
+        return self.box.bbox
 
 
 @dataclass
@@ -27,6 +48,7 @@ class OpponentCard:
     region: Region  # Actual screenshot pixels, NOT reference coordinates.
     identity: str
     target_source: str
+    power_verified: bool = False
 
 
 class AutoTargeting:
@@ -37,10 +59,15 @@ class AutoTargeting:
         self.config = config
         self.last_cards: List[OpponentCard] = []
         self.last_image: Optional[np.ndarray] = None
+        self.last_reason = ""
+        self.last_input = "原始截图"
 
     def _boxes(self, image: np.ndarray) -> List[OCRBox]:
         try:
-            return [b for b in self.ocr.recognize(image) if b.confidence >= 0.5 and b.text.strip()]
+            result = recognize_frame(self.ocr, image, self.config.ocr)
+            self.last_input = result.input_mode
+            return [b for b in result.boxes
+                    if b.confidence >= self.config.calibration.min_ocr_confidence and b.text.strip()]
         except StoppedError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -48,7 +75,7 @@ class AutoTargeting:
 
     def read_challenge(self, image: np.ndarray) -> Optional[ChallengeCount]:
         """Only accept counts next to configured challenge-label anchors."""
-        boxes = self._boxes(image)
+        boxes = [b for b in self._boxes(image) if b.confidence >= 0.5]
         keywords = [part for text in self.config.profile.challenge_keywords for part in split_ocr_text(text)]
         anchors = [b for b in boxes if any(k in b.text for k in keywords)]
         candidates = set()
@@ -65,14 +92,79 @@ class AutoTargeting:
                 if same_row and near:
                     candidates.add(parsed)
         if len(candidates) != 1:
-            return None
+            if candidates:
+                return None  # Never override ambiguous evidence with a fallback.
+            return self._read_challenge_separator(image, boxes, anchors)
         current, maximum = candidates.pop()
         return ChallengeCount(current, maximum)
 
+    def _read_challenge_separator(self, image, boxes, anchors):
+        """If '/' was read as '1', require a real slanted separator in the image.
+
+        No global substitution of '1' or guessing 415 == 4/5. Only an anchored
+        three-glyph number with a geometric slash can be split and OCR'd anew.
+        """
+        reader = self.ocr.provider if isinstance(self.ocr, OcrEngine) else self.ocr
+        if getattr(reader, "prefers_single_line", False) is not True:
+            return None
+        results = set()
+        for box in boxes:
+            x, y, w, h = box.bbox
+            if not any(abs((y + h / 2) - (a.bbox[1] + a.bbox[3] / 2)) <= max(h, a.bbox[3]) * 1.5
+                       and x >= a.bbox[0] + a.bbox[2] * 0.7
+                       and x - (a.bbox[0] + a.bbox[2]) < image.shape[1] * 0.2 for a in anchors):
+                continue
+            crop = crop_region(image, box.bbox)
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            for mask in (binary, cv2.bitwise_not(binary)):
+                count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+                glyphs = [(i, stats[i]) for i in range(1, count)
+                          if stats[i, 3] >= h * 0.4 and stats[i, 4] >= 4
+                          and stats[i, 0] > 0 and stats[i, 0] + stats[i, 2] < w
+                          and stats[i, 1] > 0 and stats[i, 1] + stats[i, 3] < h]
+                if len(glyphs) != 3:
+                    continue
+                glyphs.sort(key=lambda item: item[1][0])
+                middle_id, middle = glyphs[1]
+                mx, my, mw, mh, area = middle
+                if not 0.25 <= mw / mh <= 0.65 or area / (mw * mh) > 0.7:
+                    continue
+                ys, xs = np.where(labels == middle_id)
+                third = max(1, int(mh // 3))
+                upper, lower = xs[ys < my + third], xs[ys >= my + mh - third]
+                if not len(upper) or not len(lower) or np.mean(upper) - np.mean(lower) < mh * 0.16:
+                    continue
+                values = []
+                for _, glyph in (glyphs[0], glyphs[2]):
+                    gx, gy, gw, gh, _ = glyph
+                    # A small border avoids clipping single digits for the rec model.
+                    digit = crop[max(0, gy - 3):min(h, gy + gh + 3), max(0, gx - 3):min(w, gx + gw + 3)]
+                    read = reader.recognize_line(digit)
+                    text = "".join(b.text.strip() for b in read if b.confidence >= 0.7)
+                    if not text.isdecimal():
+                        break
+                    values.append(text)
+                if len(values) == 2:
+                    parsed = parse_challenge_count("/".join(values))
+                    if parsed is not None:
+                        results.add(parsed)
+        if len(results) != 1:
+            return None
+        return ChallengeCount(*results.pop())
+
     def scan(self, image: np.ndarray) -> List[OpponentCard]:
         self.last_image = image
+        self.last_reason = "未识别到可靠的列表布局"
         self.last_cards = self.detect_cards(image, self._boxes(image))
+        if self.last_cards:
+            self.last_reason = ""
         return self.last_cards
+
+    @property
+    def input_mode(self) -> str:
+        """Which OCR input produced the current result (原始/预处理截图)."""
+        return self.last_input
 
     def detect_cards(self, image: np.ndarray, boxes: Sequence[OCRBox]) -> List[OpponentCard]:
         """Do not synthesize missing rows or accept cropped bottom cards."""
@@ -80,34 +172,76 @@ class AutoTargeting:
         keywords = [part for text in self.config.profile.arena_select_keywords for part in split_ocr_text(text)]
         anchors = [b for b in boxes if b.confidence >= 0.5 and any(k in b.text for k in keywords)]
         if len(anchors) != 1:
+            self.last_reason = "没有唯一可靠的选择对手标题"
             return []
         anchor = anchors[0]
         panel_top = anchor.bbox[1] + anchor.bbox[3]
-        mapper = CoordinateMapper(width, height, width, height)
+        mapper = CoordinateMapper(self.config.screen.reference_width, self.config.screen.reference_height,
+                                  width, height)
         detector = OpponentDetector(self.config, mapper)
         candidates = [c for c in detector.extract_candidates(boxes)
                       if c.bbox[1] > panel_top and c.bbox[0] > anchor.bbox[0]
                       and detector._label_relation(c.box, boxes) in ("own", "near")]
-        clusters = detector._cluster_by_x(candidates)
-        if not clusters:
+        # Locate rows from the reliable label, NOT from whether every number
+        # has high OCR confidence. Unknown power remains None until ROI reads.
+        header_boxes = [b for b in boxes if b.confidence >= 0.5
+                        and b.bbox[1] > panel_top and b.bbox[0] > anchor.bbox[0]
+                        and any(k in b.text for k in ("战斗力", "战力"))]
+        headers = []
+        for box in sorted(header_boxes, key=lambda b: b.bbox[1]):
+            cy = box.bbox[1] + box.bbox[3] / 2
+            if headers and abs(cy - headers[-1].cy) < box.bbox[3] * 0.6:
+                continue
+            nearby = [c for c in candidates if abs(c.cy - cy) <= box.bbox[3] * 1.5
+                      and c.bbox[0] >= box.bbox[0] - 5]
+            number = max(nearby, key=lambda c: c.box.confidence) if nearby else None
+            headers.append(_PowerHeader(box, number.value if number else None, number.bbox if number else None))
+        # A label can itself be missed (the first row of the original example).
+        # Recover only bare, high-confidence numbers aligned with the established
+        # power column/height; card boundaries and fresh ROI reads still govern.
+        known_regions = [h.number_region for h in headers if h.number_region is not None]
+        if len(headers) >= 2 and len(known_regions) >= 2:
+            number_x = statistics.median(r[0] for r in known_regions)
+            number_height = statistics.median(r[3] for r in known_regions)
+            for box in boxes:
+                value = parse_power(box.text)
+                x, y, w, h = box.bbox
+                cy = y + h / 2
+                if (value is None or box.confidence < 0.5 or len(str(value)) < self.config.calibration.min_power_digits
+                        or y <= panel_top or abs(x - number_x) > width * 0.03
+                        or not number_height * 0.7 <= h <= number_height * 1.6
+                        or any(k in box.text for k in ("排名", "等级", "战力", "战斗力", "金币", "钻石"))
+                        or any(abs(cy - header.cy) <= max(h, header.bbox[3]) * 1.5 for header in headers)):
+                    continue
+                headers.append(_PowerHeader(box, value, box.bbox))
+            headers.sort(key=lambda header: header.cy)
+        if len(headers) < 2:
+            self.last_reason = "可靠的战力标签少于两行"
             return []
-        ordered = sorted(max(clusters, key=len), key=lambda c: c.cy)
+        # Keep the dominant aligned label column (exclude unrelated panels).
+        median_x = statistics.median(h.bbox[0] for h in headers)
+        ordered = [h for h in headers if abs(h.bbox[0] - median_x) <= width * 0.08]
         # Two or more real OCR headers establish row spacing. No 5-slot extrapolation.
         if len(ordered) < 2:
+            self.last_reason = "可靠的战力标签列少于两行"
             return []
         distances = [b.cy - a.cy for a, b in zip(ordered, ordered[1:])]
         pitch = float(statistics.median(distances))
         if pitch < height * 0.08 or pitch > height * 0.4:
+            self.last_reason = "对手行间距不符合可见卡片布局"
             return []
         if any(abs(d - pitch) > pitch * 0.2 for d in distances):
+            self.last_reason = "对手标签缺行或行间距不一致"
             return []
 
         edges = cv2.Canny(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 50, 120)
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180, max(30, int(width * 0.04)),
-                                minLineLength=max(80, int(width * 0.3)), maxLineGap=max(5, int(width * 0.02)))
+                                minLineLength=max(80, int(width * 0.4)), maxLineGap=max(5, int(width * 0.02)))
         if lines is None:
+            self.last_reason = "未找到完整卡片边界"
             return []
-        power_right = statistics.median(c.bbox[0] + c.bbox[2] for c in ordered)
+        number_regions = [h.number_region for h in ordered if h.number_region is not None]
+        power_right = statistics.median(r[0] + r[2] for r in number_regions) if number_regions else max(h.bbox[0] + h.bbox[2] for h in ordered)
         borders = []
         for line in lines:
             x1, y1, x2, y2 = (int(v) for v in line[0])
@@ -121,8 +255,11 @@ class AutoTargeting:
             return []
         if ordered[0].bbox[1] - min(b[1] for b in borders) > pitch * 0.35:
             return []  # An earlier visible card has no recognized power header.
-        left = int(statistics.median(b[0] for b in borders))
-        right = min(width - 1, int(statistics.median(b[2] for b in borders)))
+        top_borders = [b for b in borders if any(h.bbox[1] - pitch * 0.3 <= b[1] <= h.bbox[1] + 2 for h in ordered)]
+        if not top_borders:
+            return []
+        left = int(statistics.median(b[0] for b in top_borders))
+        right = min(width - 1, int(np.percentile([b[2] for b in top_borders], 75)))
         if right - left < width * 0.3:
             return []
 
@@ -135,7 +272,9 @@ class AutoTargeting:
             top = max(tops)
             bottom = int(round(top + pitch * 0.92))
             # Prefer an observed lower boundary, near the expected card bottom.
-            bottoms = [b[1] for b in borders if top + pitch * 0.8 <= b[1] <= top + pitch * 0.98]
+            bottoms = [b[1] for b in borders if top + pitch * 0.8 <= b[1] <= top + pitch * 0.98
+                       and b[0] <= left + (right - left) * 0.04
+                       and b[2] >= right - (right - left) * 0.04]
             if bottoms:
                 bottom = min(bottoms)
             if top < 0 or bottom >= height - 3 or bottom <= top:
@@ -146,73 +285,121 @@ class AutoTargeting:
             light = (hsv[:, :, 1] < 100) & (hsv[:, :, 2] > 135)
             if float(np.mean(light)) < 0.45:
                 continue
-            # A player-name anchor provides identity and a safe clickable fallback.
+            # Names identify the row only. Click geometry comes directly from
+            # the same power-ROI calculation used by automatic calibration.
             names = [b for b in boxes if b.confidence >= 0.5 and b.text.strip()
-                     and left <= b.bbox[0] < left + (right - left) * 0.3
+                     and left <= b.bbox[0] + b.bbox[2] / 2 < left + (right - left) * 0.3
                      and top <= b.bbox[1] < top + pitch * 0.25
                      and not any(k in b.text for k in ("战力", "战斗力", "排名", "等级", "挑战"))]
             if not names:
                 continue
             name = max(names, key=lambda b: b.confidence)
-            target = (name.bbox[0] + name.bbox[2] // 2, name.bbox[1] + name.bbox[3] // 2)
-            source = "卡片名称"
-            avatar = self._avatar_center(image, region, target[0])
-            if avatar is not None:
-                target, source = avatar, "头像"
+            number_region = cand.number_region
+            if number_region is None:
+                hx, hy, hw, hh = cand.bbox
+                number_x = hx + hw
+                if number_x >= right - 5:
+                    continue
+                number_region = (number_x, hy, right - number_x, hh)
+            _, click_point = detector.power_geometry_from_bbox(number_region, pitch)
+            target = click_point.as_tuple()
             if not (left < target[0] < right and top < target[1] < bottom):
                 continue
-            opponent = Opponent(id=index + 1, power=cand.value, power_region=cand.bbox,
+            source = "半自动配置：战力 ROI 左侧"
+            opponent = Opponent(id=index + 1, power=cand.value, power_region=number_region,
                                 click_position=target)
             cards.append(OpponentCard(opponent, region, name.text.strip(), source))
+        if not cards:
+            self.last_reason = "未找到完整卡片内可靠的主体点击区域"
         return cards
 
-    @staticmethod
-    def _avatar_center(image: np.ndarray, region: Region, name_x: int):
-        left, top, width, height = region
-        x0 = max(left, int(name_x - height * 0.6))
-        x1 = min(left + int(width * 0.3), int(name_x + height * 0.6))
-        y0, y1 = top + int(height * 0.25), top + height
-        if x1 <= x0 or y1 <= y0:
-            return None
-        gray = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
-        circles = cv2.HoughCircles(cv2.GaussianBlur(gray, (5, 5), 1), cv2.HOUGH_GRADIENT,
-                                  dp=1.2, minDist=max(12, height * 0.5), param1=100, param2=25,
-                                  minRadius=max(8, int(height * 0.18)), maxRadius=max(9, int(height * 0.4)))
-        if circles is None:
-            return None
-        valid = [(int(round(x0 + x)), int(round(y0 + y))) for x, y, r in circles[0]
-                 if x - r >= 0 and x + r < x1 - x0 and y - r >= 0 and y + r < y1 - y0]
-        return valid[0] if len(valid) == 1 else None
-
     def select(self, screenshot_factory: Callable[[], np.ndarray], threshold: int, stop_event=None):
-        """Require stable identity, power and geometry on fresh frames before tap."""
-        stable_needed = max(2, self.config.recognition.stable_reads)
-        attempts = max(stable_needed, self.config.recognition.retry_count)
-        previous = None
-        streak = 0
-        for _ in range(attempts):
-            if stop_event is not None and stop_event.is_set():
-                raise StoppedError("用户停止")
-            cards = self.scan(screenshot_factory())
-            if stop_event is not None and stop_event.is_set():
-                raise StoppedError("用户停止")
+        """One layout discovery, then short-circuit stable ROI reads on new frames."""
+        for attempt in range(max(1, self.config.recognition.retry_count)):
+            self._check_stop(stop_event)
+            try:
+                cards = self.scan(screenshot_factory())
+            except OCRFailedError as exc:
+                self.last_reason = str(exc)
+                logger.warning("自动选点布局尝试 %s: %s", attempt + 1, exc)
+                continue
+            self._check_stop(stop_event)
             if not cards:
-                raise OCRFailedError("自动选点未找到可靠的完整对手卡片，禁止使用旧坐标")
-            # Do not skip an unrecognized earlier visible row to choose a later one.
-            if [c.opponent.id for c in cards] != list(range(1, len(cards) + 1)):
-                raise OCRFailedError("前序对手卡片识别不完整，禁止跳过选择")
-            selected = next((c for c in cards if c.opponent.power <= threshold), None)
-            signature = tuple((c.identity, c.opponent.power) for c in cards)
-            geometry = tuple(c.region for c in cards)
-            same = previous is not None and previous[0] == signature
-            if same:
-                tolerance = max(3, int(min(self.last_image.shape[:2]) * 0.015))
-                same = all(abs(a - b) <= tolerance for ra, rb in zip(previous[1], geometry) for a, b in zip(ra, rb))
-            streak = streak + 1 if same else 1
-            previous = (signature, geometry)
-            if streak >= stable_needed:
-                return [c.opponent for c in cards], selected.opponent if selected else None
-        raise OCRFailedError("对手列表正在变化或战力不稳定，取消点击")
+                logger.warning("自动选点布局尝试 %s: %s", attempt + 1, self.last_reason)
+                continue
+            logger.info("自动选点布局尝试 %s: 找到 %s 张完整卡片，开始按顺序复核数字 ROI", attempt + 1, len(cards))
+            confirmed = []
+            latest = self.last_image
+            try:
+                for expected, card in enumerate(cards, 1):
+                    if card.opponent.id != expected:
+                        raise OCRFailedError("前序对手卡片识别不完整，禁止跳过选择")
+                    value, latest = self._confirm_card(card, screenshot_factory, stop_event)
+                    card.opponent.power = value
+                    card.power_verified = True
+                    confirmed.append(card.opponent)
+                    if value <= threshold:
+                        self.last_image = latest
+                        logger.info("自动选点 #%s 战力 %s 已通过多帧 ROI 校验，跳过后续卡片", card.opponent.id, value)
+                        return confirmed, card.opponent
+                self.last_image = latest
+                return confirmed, None
+            except OCRFailedError as exc:
+                self.last_reason = str(exc)
+                logger.warning("自动选点尝试 %s 未通过: %s；重新定位列表", attempt + 1, exc)
+        raise OCRFailedError(f"自动选点重试耗尽（{self.last_reason}），取消点击，不使用旧坐标")
+
+    @staticmethod
+    def _check_stop(stop_event):
+        if stop_event is not None and stop_event.is_set():
+            raise StoppedError("用户停止")
+
+    def _confirm_card(self, card, screenshot_factory, stop_event):
+        needed = max(2, self.config.recognition.stable_reads)
+        previous, streak = None, 0
+        for read in range(max(needed, self.config.recognition.retry_count)):
+            self._check_stop(stop_event)
+            image = screenshot_factory()
+            if not self.verify_target(image, card.opponent):
+                raise OCRFailedError(f"#{card.opponent.id} 卡片画面已变化，可能刷新或滚动")
+            value = self._read_power(image, card.opponent.power_region)
+            self._check_stop(stop_event)
+            logger.info("自动选点 #%s 数字 ROI 第 %s 次: %s", card.opponent.id, read + 1, value if value is not None else "OCR_FAILED")
+            streak = streak + 1 if value is not None and value == previous else 1 if value is not None else 0
+            previous = value
+            if streak >= needed:
+                return value, image
+        raise OCRFailedError(f"#{card.opponent.id} 数字 ROI 识别失败或战力不稳定")
+
+    def _read_power(self, image, region):
+        """Fresh numeric-only ROI recognition; no cache can fake stable reads."""
+        try:
+            crop = crop_region(image, region)
+            if isinstance(self.ocr, OcrEngine):
+                boxes, _ = self.ocr.read_roi(image, region, allowlist=self.config.ocr.power_allowlist,
+                                            preprocess=True, cache_key=None, force=True)
+                if not any(b.confidence >= 0.5 and parse_power(b.text) is not None for b in boxes):
+                    # Retry the original crop, rather than repeating the same
+                    # thresholded input; keep RapidOCR's single-line fast path.
+                    boxes2, _ = self.ocr.read_roi(image, region, allowlist=self.config.ocr.power_allowlist,
+                                                  preprocess=False, cache_key=None, force=True)
+                    if any(b.confidence >= 0.5 and parse_power(b.text) is not None for b in boxes2):
+                        boxes = boxes2
+            else:
+                boxes = self.ocr.recognize(preprocess_for_ocr(crop, self.config.ocr))
+                if not any(b.confidence >= 0.5 and parse_power(b.text) is not None for b in boxes):
+                    boxes = self.ocr.recognize(crop)
+            numeric = [b for b in boxes if b.confidence >= 0.5 and parse_power(b.text) is not None]
+            if not numeric:
+                return None
+            # OCR sometimes splits comma-separated digits into adjacent pieces.
+            text = " ".join(b.text for b in sorted(numeric, key=lambda b: b.bbox[0]))
+            return parse_power(text)
+        except StoppedError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("自动战力 ROI 识别异常: %s", exc)
+            return None
 
     def draw(self, image: np.ndarray) -> np.ndarray:
         result = image.copy()
@@ -222,7 +409,8 @@ class AutoTargeting:
             point = card.opponent.click_position
             cv2.drawMarker(result, point, (255, 0, 255), cv2.MARKER_CROSS, 30, 3)
             cv2.circle(result, point, 12, (255, 0, 255), 2)
-            cv2.putText(result, f"#{card.opponent.id}: {card.opponent.power}",
+            prefix = "ok" if card.power_verified else "raw"
+            cv2.putText(result, f"#{card.opponent.id} {prefix}: {card.opponent.power}",
                         (x + 5, max(20, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2)
         return result
 

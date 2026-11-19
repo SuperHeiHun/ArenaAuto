@@ -13,6 +13,7 @@ from arena_auto.calibration.models import (
 )
 from arena_auto.models.config import AppConfig, split_ocr_text
 from arena_auto.models.recognition import OCRBox
+from arena_auto.recognition.result_text import find_result_text_boxes, normalize_ui_text
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,11 @@ class ButtonDetector:
                 continue
             if not keyword:
                 continue
-            box = self._best_box(keyword, boxes)
+            if name in ("victory", "defeat"):
+                result_boxes = find_result_text_boxes(boxes, keyword, companions=self.config.profile.exit_text)
+                box = max(result_boxes, key=lambda b: (b.confidence, b.bbox[2] * b.bbox[3])) if result_boxes else None
+            else:
+                box = self._best_box(keyword, boxes)
             if box is None:
                 logger.info("[CALIBRATION] 未找到「%s」", keyword)
                 continue
@@ -148,7 +153,8 @@ class ButtonDetector:
 
     @staticmethod
     def _matches_one(keyword: str, text: str) -> bool:
-        text = text.strip()
+        text = normalize_ui_text(text)
+        keyword = normalize_ui_text(keyword)
         if not text:
             return False
         if keyword in text:
