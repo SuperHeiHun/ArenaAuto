@@ -50,10 +50,17 @@ def main(*, ocr_provider: Optional[str] = None, ocr_device: Optional[str] = None
 
     try:
         from PySide6.QtWidgets import QApplication, QMessageBox
+        from PySide6.QtGui import QIcon
 
         app = QApplication(sys.argv)
         app.setApplicationName("ArenaAuto")
         app.setOrganizationName("ArenaAuto")
+
+        from arena_auto.paths import get_resource_path
+
+        icon_path = get_resource_path("resources/app_icon.png")
+        if icon_path.is_file():
+            app.setWindowIcon(QIcon(str(icon_path)))
 
         from arena_auto.gui.main_window import MainWindow
 

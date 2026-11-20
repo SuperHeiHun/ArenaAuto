@@ -102,6 +102,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="ArenaAuto",
+    icon=str(Path(project_root) / "resources" / "app_icon.ico"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

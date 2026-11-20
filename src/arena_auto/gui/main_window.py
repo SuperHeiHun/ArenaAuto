@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Deque, List, Optional, Tuple
 
 from PySide6.QtCore import QThread, Qt, QTimer, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -54,7 +55,7 @@ from arena_auto.logging.logger import CallbackHandler
 from arena_auto.models.config import AppConfig
 from arena_auto.models.recognition import ChallengeCount, Opponent
 from arena_auto.models.state import AutomationState, ScreenKind, SessionStatistics
-from arena_auto.paths import get_template_dir
+from arena_auto.paths import get_resource_path, get_template_dir
 from arena_auto.recognition.ocr import create_ocr_provider
 from arena_auto.recognition.template import TemplateRecognizer
 
@@ -83,6 +84,9 @@ class MainWindow(QMainWindow):
     def __init__(self, config_manager: ConfigManager, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("ArenaAuto — 胜利者的竞技场自动化")
+        icon_path = get_resource_path("resources/app_icon.png")
+        if icon_path.is_file():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1180, 820)
 
         self.config_manager = config_manager
