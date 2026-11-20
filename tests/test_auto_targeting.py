@@ -8,12 +8,14 @@ import numpy as np
 import pytest
 
 from arena_auto.automation.controller import AutomationController
+from arena_auto.calibration.coordinate_mapper import CoordinateMapper
+from arena_auto.calibration.opponent_detector import OpponentDetector
 from arena_auto.config.manager import ConfigManager
 from arena_auto.exceptions import OCRFailedError, StoppedError
 from arena_auto.models.config import AppConfig
 from arena_auto.models.recognition import ChallengeCount, DetectionResult, OCRBox, Opponent
 from arena_auto.models.state import AutomationState, ScreenKind
-from arena_auto.recognition.auto_targeting import AutoTargeting
+from arena_auto.recognition.auto_targeting import AutoTargeting, OpponentCard
 
 
 def scene(scale=1.0):
@@ -69,6 +71,82 @@ def test_no_visual_card_edges_no_coordinate_fallback():
     image, boxes = scene()
     image[:] = 0
     assert not AutoTargeting(MagicMock(), AppConfig()).detect_cards(image, boxes)
+
+
+def weak_first_card_scene():
+    image, boxes = scene()
+    # A bright background meets the pale #1 card. The top edge (196 -> 220)
+    # is below the normal Canny threshold; the lower edge is still distinct.
+    image[:100] = 196
+    boxes[2] = OCRBox("战斗力：1,115,642", 0.95, boxes[2].bbox)
+    boxes[4] = OCRBox("战斗力：462,892", 0.95, boxes[4].bbox)
+    return image, boxes
+
+
+def test_weak_top_edge_keeps_first_card_and_calibration_click_geometry():
+    image, boxes = weak_first_card_scene()
+    config = AppConfig()
+    ocr = MagicMock()
+    ocr.recognize.return_value = boxes
+    targeting = AutoTargeting(ocr, config)
+    targeting._read_power = MagicMock(side_effect=[1115642, 1115642, 462892, 462892])
+    opponents, selected = targeting.select(lambda: image.copy(), 700000)
+
+    assert [card.opponent.id for card in targeting.last_cards] == [1, 2, 3]
+    assert [o.power for o in opponents] == [1115642, 462892]
+    assert selected.id == 2
+    assert [card.power_verified for card in targeting.last_cards] == [True, True, False]
+    mapper = CoordinateMapper(config.screen.reference_width, config.screen.reference_height, 1000, 600)
+    detector = OpponentDetector(config, mapper)
+    for opponent in opponents:
+        _, click = detector.power_geometry_from_bbox(opponent.power_region, 145)
+        assert opponent.click_position == click.as_tuple()
+
+
+def test_neighbor_verified_leading_top_still_requires_visible_bottom():
+    image, boxes = weak_first_card_scene()
+    image[231:245, 330:931] = 220
+    targeting = AutoTargeting(MagicMock(), AppConfig())
+    cards = targeting.detect_cards(image, boxes)
+    assert all(card.opponent.id != 1 for card in cards)
+
+
+def test_weak_first_card_with_missing_header_blocks_later_cards():
+    image, boxes = weak_first_card_scene()
+    boxes = [b for b in boxes if b is not boxes[2]]
+    ocr = MagicMock()
+    ocr.recognize.return_value = boxes
+    targeting = AutoTargeting(ocr, AppConfig())
+    targeting._read_power = MagicMock(return_value=462892)
+    with pytest.raises(OCRFailedError):
+        targeting.select(lambda: image.copy(), 700000)
+    targeting._read_power.assert_not_called()
+
+
+@pytest.mark.parametrize("high_power", [1_000_000, 8_740_722, 10_000_000])
+def test_first_high_power_card_can_use_neighbor_validated_top_geometry(high_power):
+    image, boxes = scene()
+    # The first card border has almost no contrast against the arena panel, so
+    # even the low-threshold Hough retry cannot see it. Other rows keep clear
+    # boundaries from which the normal top inset/pitch can be measured.
+    image[:100, 330:931] = 210
+    boxes[2] = OCRBox(f"战斗力：{high_power:,}", 0.95, boxes[2].bbox)
+    boxes[4] = OCRBox("战斗力：11,460", 0.95, boxes[4].bbox)
+    config = AppConfig()
+    ocr = MagicMock()
+    ocr.recognize.return_value = boxes
+    targeting = AutoTargeting(ocr, config)
+    targeting._read_power = MagicMock(side_effect=[high_power, high_power, 11460, 11460])
+    threshold = min(4_000_000, high_power - 1)
+
+    opponents, selected = targeting.select(lambda: image.copy(), threshold)
+
+    cards = targeting.last_cards
+    assert [card.opponent.id for card in cards] == [1, 2, 3]
+    assert [opponent.power for opponent in opponents] == [high_power, 11460]
+    assert selected.id == 2 and selected.power == 11460
+    assert cards[0].region[1] == pytest.approx(cards[1].region[1] - 145, abs=2)
+    assert cards[0].region[1] + cards[0].region[3] < cards[1].region[1]
 
 
 def test_stable_selection_uses_two_fresh_frames_and_actual_pixels():
@@ -190,6 +268,76 @@ def test_prepare_transition_confirms_and_resets_attempts(tmp_path):
     assert ctrl.ctx.auto_selection_attempts == 0
 
 
+def _prepare_with_detected_card(ctrl, *, save_config=True):
+    image = np.zeros((600, 1000, 3), dtype=np.uint8)
+    card = OpponentCard(
+        opponent=Opponent(
+            2,
+            67499,
+            power_region=(700, 110, 160, 25),
+            click_position=(390, 180),
+        ),
+        region=(330, 100, 600, 130),
+        identity="Player2",
+        target_source="power",
+        power_verified=True,
+    )
+    ctrl.config.automation.auto_targeting_save_config = save_config
+    ctrl.auto_targeting.last_cards = [card]
+    ctrl.auto_targeting.last_image = image
+    ctrl.ctx.target = card.opponent
+    ctrl.ctx.auto_selection_attempts = 1
+    ctrl.adb.screenshot.return_value = image
+    ctrl.detector.detect = MagicMock(return_value=ScreenKind.PREPARE)
+    ctrl._wait = MagicMock(return_value=False)
+    ctrl.sm.transition(AutomationState.WAIT_PREPARE)
+    ctrl._state_wait_prepare()
+    return card
+
+
+def test_auto_init_success_saves_opponent_geometry_in_reference_pixels(tmp_path):
+    ctrl = controller(tmp_path)
+    ctrl.config_manager.save()
+    _prepare_with_detected_card(ctrl)
+
+    assert ctrl.sm.state == AutomationState.PREPARE
+    saved = ConfigManager(ctrl.config_manager.path).load()
+    opponent = saved.opponents[1]
+    assert opponent.power_region == (1344, 198, 307, 45)
+    assert opponent.click == (749, 324)
+    assert opponent.source == "calibrated"
+    assert opponent.confidence == 1.0
+    # The live config object is updated only after the successful YAML write.
+    assert ctrl.config_manager.config.opponents[1].click == (749, 324)
+    assert ctrl.ctx.auto_config_saved
+    assert saved.automation.power_threshold == ctrl.config.automation.power_threshold
+
+
+def test_auto_init_save_setting_disabled_keeps_config_untouched(tmp_path):
+    ctrl = controller(tmp_path)
+    ctrl.config_manager.save()
+    _prepare_with_detected_card(ctrl, save_config=False)
+
+    assert ctrl.sm.state == AutomationState.PREPARE
+    saved = ConfigManager(ctrl.config_manager.path).load()
+    assert saved.opponents[1].power_region == (0, 0, 100, 50)
+    assert saved.opponents[1].click == (0, 0)
+    assert not ctrl.ctx.auto_config_saved
+
+
+def test_auto_init_save_failure_does_not_block_prepare(tmp_path, monkeypatch):
+    ctrl = controller(tmp_path)
+    monkeypatch.setattr(
+        ctrl.config_manager,
+        "save_opponent_geometry",
+        MagicMock(side_effect=OSError("disk full")),
+    )
+    _prepare_with_detected_card(ctrl)
+
+    assert ctrl.sm.state == AutomationState.PREPARE
+    assert not ctrl.ctx.auto_config_saved
+
+
 def test_auto_purchase_does_not_bypass_authorization(tmp_path):
     ctrl = controller(tmp_path)
     ctrl.config.purchase.enabled = False
@@ -206,6 +354,10 @@ def test_auto_config_roundtrip(tmp_path):
     assert manager.load().automation.auto_targeting
     assert ConfigManager.from_dict({}).automation.auto_targeting
     assert not ConfigManager.from_dict({"automation": {"auto_targeting": False}}).automation.auto_targeting
+    assert ConfigManager.from_dict({}).automation.auto_targeting_save_config
+    assert not ConfigManager.from_dict(
+        {"automation": {"auto_targeting_save_config": False}}
+    ).automation.auto_targeting_save_config
 
 
 def test_stop_after_ocr_before_any_selection():
@@ -283,10 +435,14 @@ def test_gui_auto_targeting_toggle(qt_app, monkeypatch, tmp_path):
     window = MainWindow(manager)
     try:
         assert not window.auto_target_check.isChecked()
+        assert window.auto_save_check.isChecked()
         window.auto_target_check.setChecked(True)
+        window.auto_save_check.setChecked(False)
         assert window._apply_form_to_config()
         manager.save()
-        assert manager.load().automation.auto_targeting
+        loaded = manager.load()
+        assert loaded.automation.auto_targeting
+        assert not loaded.automation.auto_targeting_save_config
     finally:
         window.close()
 
@@ -528,7 +684,7 @@ def test_auto_wait_prepare_does_not_retry_on_first_arena_frame(tmp_path):
     assert ctrl.sm.state == AutomationState.WAIT_PREPARE
     ctrl.adb.tap.assert_not_called()
     assert ctrl.ctx.opponent_wait_snapshot_saved
-    ctrl.sm._entered_at = time.monotonic() - 4
+    ctrl.sm._entered_at = time.monotonic() - 6
     ctrl._state_wait_prepare()
     assert ctrl.sm.state == AutomationState.ARENA
 

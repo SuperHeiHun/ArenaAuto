@@ -15,6 +15,16 @@ def split_ocr_text(value: str) -> List[str]:
     return list(dict.fromkeys(part.strip() for part in re.split(r"[,，\r\n]+", value) if part.strip()))
 
 
+def normalize_ocr_language(value: str) -> str:
+    """Canonical Config language across providers; never combine incompatible Readers."""
+    language = str(value or "ch").strip().lower()
+    return {
+        "zh": "ch", "zh_cn": "ch", "zh-cn": "ch", "ch_sim": "ch",
+        "ja": "japan", "jp": "japan", "japanese": "japan",
+        "ko": "korean", "kr": "korean",
+    }.get(language, language)
+
+
 @dataclass
 class AdbConfig:
     executable: str = "adb"
@@ -31,6 +41,8 @@ class AutomationSettings:
     dry_run: bool = False
     auto_targeting: bool = False  # UI: 自动初始化. First-launch policy is in ConfigManager.
     auto_targeting_max_attempts: int = 2
+    # UI: 自动初始化成功后，把识别到的对手 ROI/点击写入 config.yaml。
+    auto_targeting_save_config: bool = True
 
 
 @dataclass
@@ -57,7 +69,7 @@ class OcrSettings:
     scale: int = 3
     threshold: bool = True
     whitelist: str = "0123456789,"
-    lang: str = "ch"
+    lang: str = "ch"  # ch | japan | korean
     dpi: int = 300
     device: str = "auto"  # auto | cpu | cuda (EasyOCR) | directml (RapidOCR)
     gpu_device_id: int = 0
@@ -204,20 +216,20 @@ class ArenaProfile:
 
     display_name: str = "胜利者的竞技场"
     arena_title_keywords: List[str] = field(
-        default_factory=lambda: ["胜利者的竞技场"]
+        default_factory=lambda: ["胜利者的竞技场", "승자의 줘팸터"]
     )
     arena_select_keywords: List[str] = field(
-        default_factory=lambda: ["请选择对手"]
+        default_factory=lambda: ["请选择对手", "대전 상대를 선택하여 주세요", "대전 상대"]
     )
     challenge_keywords: List[str] = field(
-        default_factory=lambda: ["可挑战次数"]
+        default_factory=lambda: ["可挑战次数", "도전 가능 횟수"]
     )
-    go_win_text: str = "去获胜"
-    exit_text: str = "退出"
-    victory_text: str = "胜利"
-    defeat_text: str = "失败"
-    buy_text: str = "购买挑战次数"
-    confirm_text: str = "确认"
+    go_win_text: str = "去获胜,이기러 간다"
+    exit_text: str = "退出,나가기"
+    victory_text: str = "胜利,VICTORY"
+    defeat_text: str = "失败,DEFEAT"
+    buy_text: str = "购买挑战次数,도전 횟수 구매,구매"
+    confirm_text: str = "确认,확인"
     min_keyword_matches: int = 1
 
 

@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 
 from arena_auto.calibration.coordinate_mapper import CoordinateMapper
-from arena_auto.calibration.opponent_detector import OpponentDetector
+from arena_auto.calibration.opponent_detector import OpponentDetector, POWER_KEYWORDS, NON_OPPONENT_KEYWORDS
 from arena_auto.exceptions import OCRFailedError, StoppedError
 from arena_auto.models.config import AppConfig, split_ocr_text
 from arena_auto.models.recognition import ChallengeCount, OCRBox, Opponent, Region
@@ -23,6 +23,7 @@ from arena_auto.recognition.ocr import OCRProvider, parse_challenge_count, parse
 from arena_auto.recognition.ocr_engine import OcrEngine
 from arena_auto.recognition.ocr_pipeline import recognize_frame
 from arena_auto.recognition.screen import crop_region
+from arena_auto.recognition.result_text import normalize_ui_text
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class AutoTargeting:
         """Only accept counts next to configured challenge-label anchors."""
         boxes = [b for b in self._boxes(image) if b.confidence >= 0.5]
         keywords = [part for text in self.config.profile.challenge_keywords for part in split_ocr_text(text)]
-        anchors = [b for b in boxes if any(k in b.text for k in keywords)]
+        anchors = [b for b in boxes if any(normalize_ui_text(k) in normalize_ui_text(b.text) for k in keywords)]
         candidates = set()
         _, width = image.shape[:2]
         for box in boxes:
@@ -170,7 +171,8 @@ class AutoTargeting:
         """Do not synthesize missing rows or accept cropped bottom cards."""
         height, width = image.shape[:2]
         keywords = [part for text in self.config.profile.arena_select_keywords for part in split_ocr_text(text)]
-        anchors = [b for b in boxes if b.confidence >= 0.5 and any(k in b.text for k in keywords)]
+        anchors = [b for b in boxes if b.confidence >= 0.5
+                   and any(normalize_ui_text(k) in normalize_ui_text(b.text) for k in keywords)]
         if len(anchors) != 1:
             self.last_reason = "没有唯一可靠的选择对手标题"
             return []
@@ -186,7 +188,8 @@ class AutoTargeting:
         # has high OCR confidence. Unknown power remains None until ROI reads.
         header_boxes = [b for b in boxes if b.confidence >= 0.5
                         and b.bbox[1] > panel_top and b.bbox[0] > anchor.bbox[0]
-                        and any(k in b.text for k in ("战斗力", "战力"))]
+                        and any(k in b.text for k in POWER_KEYWORDS)
+                        and not any(k in b.text for k in ("防御", "방어덱"))]
         headers = []
         for box in sorted(header_boxes, key=lambda b: b.bbox[1]):
             cy = box.bbox[1] + box.bbox[3] / 2
@@ -210,7 +213,7 @@ class AutoTargeting:
                 if (value is None or box.confidence < 0.5 or len(str(value)) < self.config.calibration.min_power_digits
                         or y <= panel_top or abs(x - number_x) > width * 0.03
                         or not number_height * 0.7 <= h <= number_height * 1.6
-                        or any(k in box.text for k in ("排名", "等级", "战力", "战斗力", "金币", "钻石"))
+                        or any(k in box.text for k in NON_OPPONENT_KEYWORDS + POWER_KEYWORDS)
                         or any(abs(cy - header.cy) <= max(h, header.bbox[3]) * 1.5 for header in headers)):
                     continue
                 headers.append(_PowerHeader(box, value, box.bbox))
@@ -233,8 +236,12 @@ class AutoTargeting:
         if any(abs(d - pitch) > pitch * 0.2 for d in distances):
             self.last_reason = "对手标签缺行或行间距不一致"
             return []
+        if ordered[0].bbox[1] - panel_top > pitch * 0.35:
+            self.last_reason = "前序对手缺少战力标签，禁止跳过选择"
+            return []
 
-        edges = cv2.Canny(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 50, 120)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 120)
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180, max(30, int(width * 0.04)),
                                 minLineLength=max(80, int(width * 0.4)), maxLineGap=max(5, int(width * 0.02)))
         if lines is None:
@@ -253,30 +260,82 @@ class AutoTargeting:
                 borders.append((left, int(round((y1 + y2) / 2)), right))
         if not borders:
             return []
-        if ordered[0].bbox[1] - min(b[1] for b in borders) > pitch * 0.35:
-            return []  # An earlier visible card has no recognized power header.
-        top_borders = [b for b in borders if any(h.bbox[1] - pitch * 0.3 <= b[1] <= h.bbox[1] + 2 for h in ordered)]
+        first_y = ordered[0].bbox[1]
+        if first_y - min(b[1] for b in borders) > pitch * 0.35:
+            self.last_reason = "前序对手卡片缺少可靠战力标签，禁止跳过选择"
+            return []
+
+        def matches_top(y, header):
+            return header.bbox[1] - pitch * 0.3 <= y <= header.bbox[1] + 2
+
+        tops_by_row = [[b for b in borders if matches_top(b[1], header)] for header in ordered]
+        top_borders = [b for tops in tops_by_row for b in tops]
         if not top_borders:
             return []
         left = int(statistics.median(b[0] for b in top_borders))
         right = min(width - 1, int(np.percentile([b[2] for b in top_borders], 75)))
-        if right - left < width * 0.3:
+        card_width = right - left
+        if card_width < width * 0.3:
             return []
 
+        def observed_bottom(top):
+            return min((y for x1, y, x2 in borders
+                        if top + pitch * 0.8 <= y <= top + pitch * 0.98
+                        and x1 <= left + card_width * 0.04
+                        and x2 >= right - card_width * 0.04), default=None)
+
+        # A pale border (e.g. the top card against a bright background) can
+        # disappear at normal contrast. Retry only inside the established card
+        # column, without letting weak lines change its horizontal bounds.
+        missing_tops = [h.bbox[1] for h, tops in zip(ordered, tops_by_row) if not tops]
+        weak_tops = []
+        if missing_tops or first_y - panel_top > pitch * 0.35:
+            stop = min(height, max([first_y] + missing_tops) + 4)
+            weak_tops = self._weak_top_edges(gray, left, right, max(0, panel_top), stop)
+            if any(first_y - y > pitch * 0.35 for y in weak_tops):
+                self.last_reason = "前序对手卡片缺少可靠战力标签，禁止跳过选择"
+                return []
+
         cards = []
-        for index, cand in enumerate(ordered):
+        for index, (cand, tops) in enumerate(zip(ordered, tops_by_row)):
             # A visible horizontal boundary must corroborate each header.
-            tops = [b[1] for b in borders if cand.bbox[1] - pitch * 0.3 <= b[1] <= cand.bbox[1] + 2]
-            if not tops:
-                continue
-            top = max(tops)
-            bottom = int(round(top + pitch * 0.92))
-            # Prefer an observed lower boundary, near the expected card bottom.
-            bottoms = [b[1] for b in borders if top + pitch * 0.8 <= b[1] <= top + pitch * 0.98
-                       and b[0] <= left + (right - left) * 0.04
-                       and b[2] >= right - (right - left) * 0.04]
-            if bottoms:
-                bottom = min(bottoms)
+            if tops:
+                top = max(b[1] for b in tops)
+                bottom = observed_bottom(top)
+                if bottom is None:
+                    bottom = int(round(top + pitch * 0.92))
+            else:
+                # A weak top alone is not enough: require an observed strong
+                # bottom too, rather than estimating a card from OCR spacing.
+                for top in sorted(set(weak_tops), reverse=True):
+                    if matches_top(top, cand) and (bottom := observed_bottom(top)) is not None:
+                        break
+                else:
+                    # A banner can completely cover the first row's top edge.
+                    # Recover that leading row only when its own OCR power
+                    # header supplies the row anchor, later visible rows agree
+                    # on the header-to-top inset, the next card top corroborates
+                    # the pitch, and this card's lower boundary is visible.
+                    # This never extrapolates a missing power row or an interior
+                    # gap and cannot make us skip an unknown earlier opponent.
+                    if (index != 0 or len(ordered) < 2 or not tops_by_row[1]
+                            or cand.bbox[1] - panel_top > pitch * 0.35):
+                        continue
+                    measured_insets = [
+                        header.bbox[1] - max(boundary[1] for boundary in row_tops)
+                        for header, row_tops in zip(ordered[1:], tops_by_row[1:])
+                        if row_tops
+                    ]
+                    if not measured_insets:
+                        continue
+                    top = int(round(cand.bbox[1] - statistics.median(measured_insets)))
+                    next_top = max(boundary[1] for boundary in tops_by_row[1])
+                    if (not matches_top(top, cand)
+                            or abs((next_top - top) - pitch) > pitch * 0.15):
+                        continue
+                    bottom = observed_bottom(top)
+                    if bottom is None:
+                        continue
             if top < 0 or bottom >= height - 3 or bottom <= top:
                 continue
             region = (left, top, right - left, bottom - top)
@@ -290,7 +349,7 @@ class AutoTargeting:
             names = [b for b in boxes if b.confidence >= 0.5 and b.text.strip()
                      and left <= b.bbox[0] + b.bbox[2] / 2 < left + (right - left) * 0.3
                      and top <= b.bbox[1] < top + pitch * 0.25
-                     and not any(k in b.text for k in ("战力", "战斗力", "排名", "等级", "挑战"))]
+                     and not any(k in b.text for k in NON_OPPONENT_KEYWORDS + POWER_KEYWORDS)]
             if not names:
                 continue
             name = max(names, key=lambda b: b.confidence)
@@ -312,6 +371,22 @@ class AutoTargeting:
         if not cards:
             self.last_reason = "未找到完整卡片内可靠的主体点击区域"
         return cards
+
+    @staticmethod
+    def _weak_top_edges(gray: np.ndarray, left: int, right: int, start: int, stop: int) -> List[int]:
+        """Find lower-contrast edges spanning nearly the entire card column."""
+        if stop - start < 3:
+            return []
+        height, width = gray.shape
+        card_width = right - left
+        edges = cv2.Canny(gray[start:stop, left:right], 35, 80)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, max(30, int(width * 0.04)),
+                                minLineLength=int(card_width * 0.9), maxLineGap=max(5, int(width * 0.02)))
+        if lines is None:
+            return []
+        return [start + int(round((y1 + y2) / 2)) for ((x1, y1, x2, y2),) in lines
+                if abs(y1 - y2) <= max(3, height * 0.005)
+                and min(x1, x2) <= card_width * 0.04 and max(x1, x2) >= card_width * 0.96]
 
     def select(self, screenshot_factory: Callable[[], np.ndarray], threshold: int, stop_event=None):
         """One layout discovery, then short-circuit stable ROI reads on new frames."""

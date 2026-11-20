@@ -22,7 +22,7 @@ from arena_auto.recognition.ocr import parse_power
 
 logger = logging.getLogger(__name__)
 
-_NEIGHBOR_EXCLUDE_KEYWORDS = (
+NON_OPPONENT_KEYWORDS = (
     "金币",
     "钻石",
     "点券",
@@ -34,10 +34,17 @@ _NEIGHBOR_EXCLUDE_KEYWORDS = (
     "战绩",
     "胜场",
     "防御",
+    "방어덱",
+    "순위",
+    "랭킹",
+    "보상",
+    "도전",
+    "레벨",
+    "Lv.",
 )
 
 # Positive labels: prefer OCR boxes like "战斗力：1,234,567" over bare numbers.
-_POWER_KEYWORDS = ("战斗力", "战力")
+POWER_KEYWORDS = ("战斗力", "战力", "전투력", "전투럭")
 
 
 @dataclass
@@ -172,11 +179,11 @@ class OpponentDetector:
             "near"    — a separate "战斗力" label box is nearest
             ""        — no keyword context
         """
-        if any(kw in box.text for kw in _NEIGHBOR_EXCLUDE_KEYWORDS):
+        if any(kw in box.text for kw in NON_OPPONENT_KEYWORDS):
             # own text wins even if it also contains 战力
             # (e.g. "防御卡组战斗力" / "挑战战斗力xxx")
             return "exclude"
-        if any(kw in box.text for kw in _POWER_KEYWORDS):
+        if any(kw in box.text for kw in POWER_KEYWORDS):
             return "own"
 
         bx, by, bw, bh = box.bbox
@@ -194,10 +201,10 @@ class OpponentDetector:
             dist = ((ocx - bcx) ** 2 + (ocy - bcy) ** 2) ** 0.5
             # exclude beats power inside the same neighbor box
             # (e.g. "防御卡组战斗力" is both)
-            if any(kw in other.text for kw in _NEIGHBOR_EXCLUDE_KEYWORDS):
+            if any(kw in other.text for kw in NON_OPPONENT_KEYWORDS):
                 if best_exclude is None or dist < best_exclude:
                     best_exclude = dist
-            elif any(kw in other.text for kw in _POWER_KEYWORDS):
+            elif any(kw in other.text for kw in POWER_KEYWORDS):
                 if best_power is None or dist < best_power:
                     best_power = dist
         if best_power is not None and (

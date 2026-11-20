@@ -17,6 +17,8 @@ datas = []
 resource_root = Path(project_root) / "resources"
 for asset in sorted(resource_root.rglob("*")):
     relative = asset.relative_to(resource_root)
+    if relative.parts[:2] == ("models", "easyocr") and find_spec("easyocr") is None:
+        continue  # Do not bundle unused PyTorch weights in the lean DirectML build.
     if asset.is_file() and "generated" not in relative.parts:
         datas.append((str(asset), str(Path("resources") / relative.parent)))
 

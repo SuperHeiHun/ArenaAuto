@@ -78,12 +78,8 @@ _THOUSAND_SEP_RE = re.compile(r"[,\s.]+")
 _ALLOWED_CLEAN_RE = re.compile(r"[^0-9]")
 # Screen text is often labeled "战斗力：1,234,567" / "战力 4575674" / "Power: 123"
 _POWER_LABEL_RE = re.compile(
-    r"^\s*(?:战斗力|战力|Power)\s*[：:．.、]?\s*",
-    re.IGNORECASE,
-)
-# power label prefix, e.g. "战斗力：1,234,567" / "战力 4575674" / "Power: 1234567"
-_POWER_LABEL_RE = re.compile(
-    r"^(?:战斗力|战力|power)\s*[：:．.、,]?\s*",
+    # 전투럭 is an observed OCR-only vowel confusion in the label, not digits.
+    r"^(?:战斗力|战力|power|전투력|전투럭)\s*[：:．.、,]?\s*",
     re.IGNORECASE,
 )
 _OCR_DIGIT_MAP = {
@@ -303,6 +299,8 @@ class EasyOCRProvider(OCRProvider):
 
     _shared_reader = None
     _shared_key = None
+    _shared_readers = {}
+    _language_download_status = {}
     _shared_lock = __import__("threading").Lock()
 
     def __init__(self, settings: Optional[OcrSettings] = None) -> None:
@@ -312,7 +310,21 @@ class EasyOCRProvider(OCRProvider):
         except Exception as exc:  # noqa: BLE001
             raise OCRProviderError(f"easyocr 不可用: {exc}") from exc
 
+        from arena_auto.models.config import normalize_ocr_language
+
+        language = normalize_ocr_language(self.settings.lang)
+        language_map = {
+            "ch": ["ch_sim", "en"],
+            "japan": ["ja", "en"],
+            "korean": ["ko", "en"],
+        }
+        languages = language_map.get(language)
+        if languages is None:
+            raise OCRProviderError(f"EasyOCR 不支持语言配置: {language!r}；请选择 ch/japan/korean")
+
         device = str(getattr(self.settings, "device", "auto") or "auto").lower()
+        if language in ("korean", "japan") and device in ("directml", "dml"):
+            raise OCRProviderError("EasyOCR 的 CUDA 模型不支持 DirectML；AMD/Intel 显卡请选择 rapidocr + directml")
         if device in ("directml", "dml"):
             raise OCRProviderError("EasyOCR 不支持 DirectML，请选择 rapidocr 后端")
         if device in ("cpu", "0", "false", "no"):
@@ -326,20 +338,26 @@ class EasyOCRProvider(OCRProvider):
                 gpu = bool(torch.cuda.is_available())
             except Exception:  # noqa: BLE001
                 gpu = False
-        key = (tuple(["ch_sim", "en"]), bool(gpu))
+        key = (tuple(languages), bool(gpu))
+        self.languages = tuple(languages)
         try:
             with EasyOCRProvider._shared_lock:
-                if (
-                    EasyOCRProvider._shared_reader is None
-                    or EasyOCRProvider._shared_key != key
-                ):
-                    EasyOCRProvider._shared_reader = easyocr.Reader(
-                        ["ch_sim", "en"], gpu=gpu, verbose=False
-                    )
-                    EasyOCRProvider._shared_key = key
-                    logger.info("EasyOCR Reader 已创建 gpu=%s", gpu)
-                self._reader = EasyOCRProvider._shared_reader
-                self.device_label = "CUDA" if gpu else "CPU"
+                if key not in EasyOCRProvider._shared_readers:
+                    language_model_dir = self._ensure_easyocr_language_model(language)
+                    reader_options = {"gpu": gpu, "verbose": False}
+                    if language_model_dir is not None:
+                        reader_options["model_storage_directory"] = str(language_model_dir)
+                    EasyOCRProvider._shared_readers[key] = easyocr.Reader(languages, **reader_options)
+                    logger.info("EasyOCR Reader 已创建 languages=%s gpu=%s", languages, gpu)
+                self._reader = EasyOCRProvider._shared_readers[key]
+                EasyOCRProvider._shared_reader = self._reader
+                EasyOCRProvider._shared_key = key
+                actual_device = str(getattr(self._reader, "device", "cuda" if gpu else "cpu")).lower()
+                self.device_label = "CUDA" if actual_device.startswith("cuda") else "MPS" if actual_device == "mps" else "CPU"
+                if gpu and self.device_label == "CPU":
+                    if not self.settings.gpu_fallback_to_cpu:
+                        raise OCRProviderError("EasyOCR 请求 GPU，但当前 Reader 实际运行在 CPU；CPU 回退已关闭")
+                    logger.warning("EasyOCR GPU 不可用，实际使用 CPU languages=%s", languages)
         except Exception as exc:  # noqa: BLE001
             raise OCRProviderError(f"easyocr 初始化失败: {exc}") from exc
 
@@ -353,6 +371,32 @@ class EasyOCRProvider(OCRProvider):
         with cls._shared_lock:
             cls._shared_reader = None
             cls._shared_key = None
+            cls._shared_readers = {}
+            cls._language_download_status = {}
+
+    @classmethod
+    def _ensure_easyocr_language_model(cls, language: str):
+        """Download/checksum official Japanese/Korean weights into app resources."""
+        if language == "ch":
+            return None  # Preserve EasyOCR's existing standard model cache.
+        if cls._language_download_status.get(language):
+            return cls._language_download_status[language]
+        try:
+            from arena_auto.paths import get_writable_path
+            from arena_auto.recognition.model_store import EASYOCR_DETECTION_MODEL, EASYOCR_MODELS, download_model
+
+            model_dir = get_writable_path("resources/models/easyocr")
+            det_filename, det_url, det_digest = EASYOCR_DETECTION_MODEL
+            download_model(model_dir / det_filename, det_url, det_digest,
+                           algorithm="md5", archive_member=det_filename)
+            filename, url, digest = EASYOCR_MODELS[language]
+            download_model(model_dir / filename, url, digest, algorithm="md5", archive_member=filename)
+            cls._language_download_status[language] = model_dir
+            return model_dir
+        except OCRProviderError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise OCRProviderError(f"EasyOCR {language} 模型下载/验证失败: {exc}") from exc
 
     def recognize(self, image: np.ndarray, **kwargs) -> List[OCRBox]:
         if image is None or image.size == 0:

@@ -116,7 +116,8 @@ class ScreenDetector:
     @staticmethod
     def _count_hits(texts: str, keywords: Sequence[str]) -> int:
         # Alternatives for one UI element count as one hit, not multiple signals.
-        return sum(1 for kw in keywords if any(part in texts for part in split_ocr_text(kw)))
+        normalized = normalize_ui_text(texts)
+        return sum(1 for kw in keywords if any(normalize_ui_text(part) in normalized for part in split_ocr_text(kw)))
 
     def _template_kind(self, screenshot: np.ndarray) -> Optional[ScreenKind]:
         """Cheap OpenCV template pass before any full-screen OCR."""
@@ -149,9 +150,8 @@ class ScreenDetector:
             + self._count_hits(text_blob, profile.arena_select_keywords)
             + self._count_hits(text_blob, profile.challenge_keywords),
             ScreenKind.PREPARE: self._count_hits(text_blob, [profile.go_win_text]),
-            ScreenKind.PURCHASE: self._count_hits(
-                text_blob, [profile.buy_text, profile.confirm_text]
-            ),
+            ScreenKind.PURCHASE: self._count_hits(text_blob, [profile.buy_text])
+            + int(bool(find_result_text_boxes(boxes, profile.confirm_text))),
             ScreenKind.RESULT: int(bool(find_result_text_boxes(boxes, profile.exit_text)))
             + int(bool(find_result_text_boxes(boxes, profile.victory_text, companions=profile.exit_text)))
             + int(bool(find_result_text_boxes(boxes, profile.defeat_text, companions=profile.exit_text))),
@@ -456,8 +456,8 @@ class PowerReader:
                     boxes2, raw2 = self.engine.read_roi(
                         screenshot,
                         scaled,
-                        allowlist=None,
-                        preprocess=True,
+                        allowlist=self._allowlist,
+                        preprocess=False,
                         cache_key=None,
                         force=True,
                     )
@@ -470,6 +470,35 @@ class PowerReader:
                     if value is not None:
                         raw_text = raw2 or raw_text
                         break
+            if value is None and self.config.ocr.lang == "korean":
+                # The fixed Korean power ROI can include large empty top
+                # padding. PP-OCR may then drop the middle glyphs in 전투력
+                # (e.g. return 전력); a raw retry with the top margin removed
+                # preserves strict label and numeric parsing without guessing.
+                x, y, width, height = scaled
+                inset = max(1, int(round(height * 0.2)))
+                if height - inset >= 8:
+                    framed = (x, y + inset, width, height - inset)
+                    try:
+                        boxes3, raw3 = self.engine.read_roi(
+                            screenshot,
+                            framed,
+                            allowlist=self._allowlist,
+                            preprocess=False,
+                            cache_key=None,
+                            force=True,
+                        )
+                    except Exception:  # noqa: BLE001
+                        boxes3, raw3 = [], ""
+                    for text in [b.text for b in boxes3] + [raw3]:
+                        if not text or not str(text).strip():
+                            continue
+                        value = parse_power(str(text))
+                        if value is not None:
+                            raw_text = raw3 or str(text)
+                            break
+                    if value is None:
+                        raw_text = raw3 or raw_text
             if value is None and (raw_text or "").strip():
                 logger.warning(
                     "#%s 战力解析失败 raw=%r roi=%s", slot, raw_text, region
@@ -504,6 +533,25 @@ class PowerReader:
                 if value is not None:
                     raw_text = raw2 or raw_text
                     break
+        if (value is None and raw_text.strip()
+                and self.config.ocr.lang == "korean"):
+            inset = max(1, int(round(roi.shape[0] * 0.2)))
+            if roi.shape[0] - inset >= 8:
+                try:
+                    framed = roi[inset:, :]
+                    boxes3 = self.ocr.recognize(framed)
+                except Exception:  # noqa: BLE001
+                    boxes3 = []
+                raw3 = _join_texts(boxes3)
+                for text in [b.text for b in boxes3] + [raw3]:
+                    if not text or not str(text).strip():
+                        continue
+                    value = parse_power(str(text))
+                    if value is not None:
+                        raw_text = raw3 or str(text)
+                        break
+                if value is None:
+                    raw_text = raw3 or raw_text
         if value is None and raw_text.strip():
             logger.warning("#%s 战力解析失败 raw=%r roi=%s", slot, raw_text, region)
         return value, raw_text

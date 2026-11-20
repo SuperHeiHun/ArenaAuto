@@ -24,6 +24,7 @@ prompt2.md
 /config/config.yaml
 /config/config.calibrated.yaml
 /resources/templates/generated/
+/resources/models/
 
 # Local project memory (hardware, diagnostics and deferred work).
 /MEMORY.md

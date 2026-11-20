@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import json
+import copy
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from arena_auto.adb.controller import AdbController
 from arena_auto.automation.state_machine import StateMachine
+from arena_auto.calibration.coordinate_mapper import CoordinateMapper
+from arena_auto.calibration.models import CalibrationPoint, CalibrationRegion
 from arena_auto.config.manager import ConfigManager
 from arena_auto.debug.recorder import DebugRecorder
 from arena_auto.exceptions import (
@@ -25,7 +28,7 @@ from arena_auto.exceptions import (
     RecognitionError,
     StoppedError,
 )
-from arena_auto.models.config import AppConfig
+from arena_auto.models.config import AppConfig, OpponentConfig
 from arena_auto.models.recognition import ChallengeCount, Opponent, OCRBox
 from arena_auto.models.state import AutomationState, ScreenKind, SessionStatistics
 from arena_auto.paths import get_data_dir
@@ -78,6 +81,7 @@ class _RuntimeContext:
     # WAIT_RESULT: consecutive template-only misses (for optional OCR fallback)
     wait_result_template_fails: int = 0
     auto_selection_attempts: int = 0
+    auto_config_saved: bool = False
     result_ocr_last_at: float = 0.0
 
 
@@ -162,14 +166,17 @@ class AutomationController:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def reload_config(self) -> None:
-        self.config = self.config_manager.config
+    def reload_config(self, *, snapshot: bool = False) -> None:
+        if self._running:
+            logger.warning("自动化运行中，本轮配置已锁定；停止后才能重载")
+            return
+        self.config = copy.deepcopy(self.config_manager.config) if snapshot else self.config_manager.config
         self.adb.update_config(self.config.adb)
         self.templates.set_entries(self.config.templates)
         self.scaler.reference_width = self.config.screen.reference_width
         self.scaler.reference_height = self.config.screen.reference_height
         signature = OcrEngine.shared_provider_key(self.config.ocr)
-        if signature != self._ocr_signature:
+        if signature != self._ocr_signature or (snapshot and isinstance(self.ocr, OcrEngine) and not self.ocr.ready):
             # Rebuild lazily: changing dropdowns must not retain an old CPU Reader.
             self.ocr = create_ocr_provider(self.config.ocr)
             self.detector = ScreenDetector(self.ocr, self.config, self.templates, self.scaler)
@@ -214,11 +221,14 @@ class AutomationController:
         if self._running:
             logger.warning("自动化已在运行")
             return
+        self.reload_config(snapshot=True)
         self._running = True
-        self.reset_stop()
         self.ctx = _RuntimeContext()
         self.statistics = SessionStatistics()
         self._emit_statistics()
+        mode = "自动初始化（实时定位）" if self.config.automation.auto_targeting else "固定 ROI（已标定配置）"
+        self._log("INFO", f"本轮模式：{mode}；OCR={self.config.ocr.provider}/{self.config.ocr.lang}；"
+                  f"战力阈值={self.config.automation.power_threshold}；本轮参数已锁定")
 
         # OCR engine init happens here (worker thread), never on the GUI thread.
         try:
@@ -507,6 +517,8 @@ class AutomationController:
         except AdbError as exc:
             raise AdbDisconnectedError(str(exc)) from exc
         except OCRFailedError as exc:
+            if self.stop_event.is_set():
+                raise StoppedError("用户停止") from exc
             self.statistics.recognition_failures += 1
             self._emit_statistics()
             self._log("ERROR", str(exc))
@@ -549,6 +561,10 @@ class AutomationController:
                 pass
 
         x, y = selected.click_position
+        if not automatic:
+            # Calibrated/manual YAML stores reference coordinates. Template and
+            # live auto-targeting results already use screenshot pixels.
+            x, y = self.scaler.scale_point(x, y)
         if x == 0 and y == 0:
             self._log("ERROR", f"对手 #{selected.id} 的点击坐标未配置，禁止盲点")
             self.sm.transition(AutomationState.RECOVERY)
@@ -580,6 +596,77 @@ class AutomationController:
             return self.auto_targeting.read_challenge(image)
         return self.challenge_reader.read(image)
 
+    def _save_auto_targeting_config(self) -> None:
+        """Persist verified auto-targeting geometry after reaching PREPARE.
+
+        The run keeps using its frozen snapshot. Only opponent ROI/click fields
+        are updated, in reference-resolution coordinates, so the user can switch
+        to fixed ROI mode later without repeating the semi-automatic wizard.
+        """
+        if not self.config.automation.auto_targeting:
+            return
+        if not self.config.automation.auto_targeting_save_config:
+            return
+        if self.ctx.auto_config_saved or self.ctx.target is None:
+            return
+        if self.ctx.auto_selection_attempts <= 0:
+            return
+        image = self.auto_targeting.last_image
+        cards = self.auto_targeting.last_cards
+        if image is None or not cards:
+            return
+        if not any(card.opponent.id == self.ctx.target.id for card in cards):
+            return
+
+        height, width = image.shape[:2]
+        mapper = CoordinateMapper(
+            self.config.screen.reference_width,
+            self.config.screen.reference_height,
+            width,
+            height,
+        )
+        updates: Dict[int, OpponentConfig] = {}
+        for card in cards:
+            opponent = card.opponent
+            x, y, w, h = opponent.power_region
+            px, py = opponent.click_position
+            if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > width or y + h > height:
+                logger.warning("自动配置跳过越界战力区域: #%s %s", opponent.id, opponent.power_region)
+                continue
+            if not (0 <= px < width and 0 <= py < height):
+                logger.warning("自动配置跳过越界点击坐标: #%s %s", opponent.id, opponent.click_position)
+                continue
+            updates[opponent.id] = OpponentConfig(
+                id=opponent.id,
+                power_region=mapper.actual_region_to_reference(
+                    CalibrationRegion.from_tuple(opponent.power_region)
+                ),
+                click=mapper.actual_point_to_reference(
+                    CalibrationPoint.from_tuple(opponent.click_position)
+                ),
+                source="calibrated",
+                confidence=1.0 if card.power_verified else 0.5,
+            )
+        if not updates:
+            self._log("WARNING", "自动初始化成功，但没有可保存的有效对手坐标")
+            return
+
+        try:
+            saved = self.config_manager.save_opponent_geometry(updates)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("自动保存对手配置失败: %s", exc)
+            self._log("WARNING", f"自动初始化成功，但保存配置失败（本轮继续）: {exc}")
+            return
+        if not saved:
+            return
+        self.ctx.auto_config_saved = True
+        ids = ", ".join(f"#{opponent_id}" for opponent_id in sorted(saved))
+        self._log(
+            "INFO",
+            f"自动初始化成功：已保存对手配置 {ids} -> {self.config_manager.path}；"
+            "关闭自动初始化后可直接使用",
+        )
+
     def _state_wait_prepare(self) -> None:
         timeout = self.config.timeouts.prepare
         if self.sm.has_timed_out(timeout):
@@ -595,6 +682,7 @@ class AutomationController:
             self.ctx.opponent_wait_snapshot_saved = True
         if kind == ScreenKind.PREPARE:
             self._log("INFO", "当前页面：PREPARE")
+            self._save_auto_targeting_config()
             self.ctx.auto_selection_attempts = 0
             self.sm.transition(AutomationState.PREPARE)
             return
@@ -604,7 +692,7 @@ class AutomationController:
             return
         if kind == ScreenKind.ARENA:
             # A single early frame is not enough to declare the tap ineffective.
-            if self.config.automation.auto_targeting and self.sm.time_in_state() < min(3.0, timeout * 0.25):
+            if self.sm.time_in_state() < min(5.0, max(0.5, timeout / 3.0)):
                 self._log("INFO", "点击后暂仍在竞技场，等待页面切换，不重复点击")
                 return
             if self.config.automation.auto_targeting:
@@ -867,6 +955,7 @@ class AutomationController:
                     outcome = self.ctx.outcome or "?"
                     self._log("INFO", f"本轮完成：{outcome}")
                     self.ctx.outcome = None
+                    self._mark_progress("已确认退出结算并返回竞技场")
                     self.sm.transition(AutomationState.CHECK_CHALLENGE_COUNT)
                     return
                 # Optional full detect only with OCR fallback enabled.
@@ -877,6 +966,7 @@ class AutomationController:
                         outcome = self.ctx.outcome or "?"
                         self._log("INFO", f"本轮完成：{outcome}")
                         self.ctx.outcome = None
+                        self._mark_progress("已确认退出结算并返回竞技场")
                         self.sm.transition(AutomationState.CHECK_CHALLENGE_COUNT)
                         return
                     if kind == ScreenKind.RESULT:
@@ -983,6 +1073,8 @@ class AutomationController:
     def _finish_purchase_success(self, count: ChallengeCount) -> None:
         self.ctx.challenge = count
         self.ctx.pending_purchase = False
+        self._mark_progress("购买后已确认挑战次数恢复")
+        self._save_auto_targeting_config()
         self._log("INFO", f"购买成功，挑战次数：{count}")
         if self.callbacks.on_challenge:
             try:
@@ -1020,20 +1112,27 @@ class AutomationController:
         self.ctx.pending_purchase = False
         self.sm.transition(AutomationState.ARENA)
 
+    def _mark_progress(self, reason: str) -> None:
+        """Only verified round completion/restored attempts reset failure budget."""
+        if self.ctx.recovery_attempts:
+            self._log("INFO", f"{reason}，重置连续恢复计数")
+        self.ctx.recovery_attempts = 0
+
     def _state_recovery(self) -> None:
+        if self.stop_event.is_set():
+            raise StoppedError("用户停止")
+        max_attempts = max(1, self.config.recovery.max_attempts)
+        if self.ctx.recovery_attempts >= max_attempts:
+            self._log("ERROR", f"连续恢复已达 {max_attempts} 次且未确认有效进展，安全停止")
+            self.sm.transition(AutomationState.ERROR)
+            return
+        self.ctx.recovery_attempts += 1
         self.statistics.recoveries += 1
         self._emit_statistics()
-        max_attempts = max(1, self.config.recovery.max_attempts)
-        self.ctx.recovery_attempts += 1
         self._log(
             "WARNING",
             f"进入恢复流程 ({self.ctx.recovery_attempts}/{max_attempts})",
         )
-        if self.ctx.recovery_attempts > max_attempts:
-            self._log("ERROR", "超过最大恢复次数，安全停止")
-            self.sm.transition(AutomationState.ERROR)
-            return
-
         try:
             image = self._shot()
         except AdbError as exc:
@@ -1041,23 +1140,21 @@ class AutomationController:
 
         self.debug.save(image, category="recovery")
         kind = self.detector.detect(image)
+        if self.stop_event.is_set():
+            raise StoppedError("用户停止")
 
         if kind == ScreenKind.ARENA:
-            self.ctx.recovery_attempts = 0
             self.ctx.battle_started_at = 0.0
             self.ctx.pending_purchase = False
             self.sm.transition(AutomationState.ARENA)
             return
         if kind == ScreenKind.PREPARE:
-            self.ctx.recovery_attempts = 0
             self.sm.transition(AutomationState.PREPARE)
             return
         if kind == ScreenKind.RESULT:
-            self.ctx.recovery_attempts = 0
             self.sm.transition(AutomationState.RESULT)
             return
         if kind == ScreenKind.PURCHASE:
-            self.ctx.recovery_attempts = 0
             self.sm.transition(AutomationState.BUY_CHALLENGE)
             return
 
@@ -1094,6 +1191,9 @@ class AutomationController:
         self.sm.transition(AutomationState.ERROR)
 
     def _handle_recognition_failure(self, exc: Exception) -> None:
+        if self.stop_event.is_set():
+            self.sm.transition(AutomationState.STOPPED)
+            return
         self.statistics.recognition_failures += 1
         self._emit_statistics()
         self._log("ERROR", f"识别失败: {exc}")

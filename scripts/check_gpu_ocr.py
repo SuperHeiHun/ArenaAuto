@@ -24,7 +24,9 @@ from arena_auto.recognition.ocr_engine import OcrEngine
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("images", type=Path, nargs="+")
+    parser.add_argument("--engine", choices=("rapidocr", "easyocr"), default="rapidocr")
     parser.add_argument("--device", choices=("directml", "cpu", "auto"), default="directml")
+    parser.add_argument("--language", choices=("ch", "japan", "korean"), default="ch")
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--targeting", action="store_true", help="Also test opponent selection and challenge count")
@@ -34,16 +36,17 @@ def main() -> None:
     if args.gpu_id < 0 or args.repeat < 1:
         parser.error("gpu-id 必须 >=0，repeat 必须 >=1")
     config = AppConfig()
-    config.ocr.provider = "rapidocr"
+    config.ocr.provider = args.engine
     config.ocr.device = args.device
+    config.ocr.lang = args.language
     config.ocr.gpu_device_id = args.gpu_id
     config.ocr.gpu_fallback_to_cpu = False  # Diagnostics must not silently benchmark CPU as GPU.
     started = time.perf_counter()
     provider = create_base_ocr_provider(config.ocr, allow_fallback=False, allow_null=False)
     init_seconds = time.perf_counter() - started
     ocr = OcrEngine(provider=provider, settings=config.ocr, use_shared=False)
-    report = {"python": sys.executable, "provider": provider.name, "device": provider.device_label,
-              "session_providers": provider.session_providers, "initialization_seconds": round(init_seconds, 3),
+    report = {"python": sys.executable, "provider": provider.name, "language": args.language, "device": provider.device_label,
+              "session_providers": getattr(provider, "session_providers", {}), "initialization_seconds": round(init_seconds, 3),
               "device_actions": 0, "images": []}
     for path in args.images:
         image = cv2.imdecode(np.frombuffer(path.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)

@@ -235,4 +235,4 @@ def test_recovery_purchase_goes_buy(tmp_path: Path) -> None:
     ctrl.sm.transition(AutomationState.RECOVERY)
     ctrl._state_recovery()
     assert ctrl.sm.state == AutomationState.BUY_CHALLENGE
-    assert ctrl.ctx.recovery_attempts == 0
+    assert ctrl.ctx.recovery_attempts == 1  # Recognizing a page is not verified recovery progress.

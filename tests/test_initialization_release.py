@@ -78,6 +78,8 @@ def test_formal_labels_and_new_user_default(ui):
     assert ui.auto_cfg_btn.text() == "半自动配置"
     assert "试验" not in ui.auto_target_check.text()
     assert "无需先标定" in ui.log_view.toPlainText()
+    assert "启动时配置" in ui.log_view.toPlainText()
+    assert "开始运行时的模式日志" in ui.log_view.toPlainText()
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
@@ -114,7 +116,9 @@ def test_existing_manual_mode_retains_template_warning(ui, monkeypatch):
     prompt = MagicMock(return_value=QMessageBox.No)
     monkeypatch.setattr(QMessageBox, "question", prompt)
     assert not ui._confirm_automation_start()
-    assert prompt.call_args.args[1] == "缺少模板"
+    assert prompt.call_args.args[1] == "固定 ROI 模式"
+    assert "自动初始化未开启" in prompt.call_args.args[2]
+    assert "已标定的对手 ROI/点击坐标" in prompt.call_args.args[2]
     assert "半自动配置" in prompt.call_args.args[2]
 
 

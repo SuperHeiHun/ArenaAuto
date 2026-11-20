@@ -1,4 +1,4 @@
-"""Optional RapidOCR ONNX backend with verified Windows DirectML sessions."""
+"""Optional multilingual RapidOCR ONNX backend with verified DirectML sessions."""
 
 from __future__ import annotations
 
@@ -13,9 +13,11 @@ import cv2
 import numpy as np
 
 from arena_auto.exceptions import OCRProviderError
-from arena_auto.models.config import OcrSettings
+from arena_auto.models.config import OcrSettings, normalize_ocr_language
 from arena_auto.models.recognition import OCRBox
 from arena_auto.recognition.ocr import OCRProvider
+from arena_auto.paths import get_resource_path, get_writable_path
+from arena_auto.recognition.model_store import KOREAN_MODELS, valid_model, download_model
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +57,30 @@ class RapidOCRProvider(OCRProvider):
                 raise OCRProviderError(message)
             logger.warning("%s；RapidOCR 回退 CPU", message)
 
-        # The pinned RapidOCR wheel ships these models. Explicit paths avoid
-        # downloads and writes into the installed package or user configuration.
+        language = normalize_ocr_language(self.settings.lang)
+        if language not in ("ch", "japan", "korean"):
+            raise OCRProviderError(f"RapidOCR 不支持语言配置: {language!r}；请选择 ch/japan/korean")
+
+        # Chinese/Japanese share PP-OCRv6 multi-language models. Korean uses
+        # PP-OCRv5's dedicated Hangul recognizer and Chinese text detector.
         model_dir = Path(rapidocr.__file__).resolve().parent / "models"
-        self._model_paths = [model_dir / "PP-OCRv6_det_small.onnx", model_dir / "PP-OCRv6_rec_small.onnx"]
+        self.language = language
+        if language == "korean":
+            bundled_dir = get_resource_path("resources/models/rapidocr")
+            self._config_model_dir = get_writable_path("resources/models/rapidocr")
+            self._model_paths = []
+            for filename, url, digest in KOREAN_MODELS:
+                bundled_path = bundled_dir / filename
+                cached_path = self._config_model_dir / filename
+                if valid_model(bundled_path, digest):
+                    path = bundled_path
+                elif valid_model(cached_path, digest):
+                    path = cached_path
+                else:
+                    path = download_model(cached_path, url, digest)
+                self._model_paths.append(path)
+        else:
+            self._model_paths = [model_dir / "PP-OCRv6_det_small.onnx", model_dir / "PP-OCRv6_rec_small.onnx"]
         if any(not path.is_file() for path in self._model_paths):
             raise OCRProviderError("RapidOCR 模型缺失；请使用 requirements-gpu.txt 中固定的 rapidocr 版本")
         try:
@@ -66,6 +88,7 @@ class RapidOCRProvider(OCRProvider):
                 "Global.use_cls": False,
                 "Global.text_score": 0.3,
                 "Global.log_level": "warning",
+                "Global.model_root_dir": str(self._config_model_dir) if language == "korean" else str(model_dir),
                 "Det.model_path": str(self._model_paths[0]),
                 "Rec.model_path": str(self._model_paths[1]),
                 "EngineConfig.onnxruntime.use_dml": False,
@@ -73,6 +96,21 @@ class RapidOCRProvider(OCRProvider):
                 "EngineConfig.onnxruntime.intra_op_num_threads": 4,
                 "EngineConfig.onnxruntime.inter_op_num_threads": 1,
             })
+            from rapidocr.utils.typings import LangDet, LangRec, ModelType, OCRVersion
+
+            self._engine.cfg.Rec.lang_type = {
+                "ch": LangRec.CH, "japan": LangRec.JAPAN, "korean": LangRec.KOREAN,
+            }[language]
+            if language == "korean":
+                self._engine.cfg.Det.ocr_version = OCRVersion.PPOCRV5
+                self._engine.cfg.Det.lang_type = LangDet.CH
+                self._engine.cfg.Det.model_type = ModelType.MOBILE
+                self._engine.cfg.Rec.ocr_version = OCRVersion.PPOCRV5
+                self._engine.cfg.Rec.model_type = ModelType.MOBILE
+            elif language == "japan":
+                # V6 recognition is multilingual, and its detector is routed
+                # through the corresponding multi-language detector family.
+                self._engine.cfg.Det.lang_type = LangDet.MULTI
             # Load metadata/character lists using CPU first, then replace both
             # inference sessions with correctly configured DirectML sessions.
             models = [self._engine._load_det_model(), self._engine._load_rec_model()]
@@ -85,7 +123,7 @@ class RapidOCRProvider(OCRProvider):
                     if not self.settings.gpu_fallback_to_cpu:
                         raise OCRProviderError(f"DirectML GPU 初始化失败: {exc}") from exc
                     logger.warning("DirectML GPU 初始化失败，RapidOCR 回退 CPU: %s", exc)
-            logger.info("RapidOCR 初始化完成 device=%s sessions=%s", self.device_label, self.session_providers)
+            logger.info("RapidOCR 初始化完成 lang=%s device=%s sessions=%s", language, self.device_label, self.session_providers)
         except OCRProviderError:
             raise
         except Exception as exc:  # noqa: BLE001

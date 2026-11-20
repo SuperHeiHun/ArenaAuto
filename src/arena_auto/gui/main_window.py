@@ -7,9 +7,10 @@ import logging
 import os
 import subprocess
 import sys
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Deque, List, Optional, Tuple
 
 from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -59,6 +60,20 @@ from arena_auto.recognition.template import TemplateRecognizer
 
 logger = logging.getLogger(__name__)
 
+_LOG_LEVEL_VALUES = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def _log_level_value(level: str) -> int:
+    """Map a log level name to its numeric value (unknown -> INFO)."""
+    return _LOG_LEVEL_VALUES.get(str(level).strip().upper(), logging.INFO)
+
 
 class MainWindow(QMainWindow):
     """Main application window - all heavy work runs on worker threads."""
@@ -84,6 +99,8 @@ class MainWindow(QMainWindow):
         self._calibration_worker: Optional[CalibrationWorker] = None
         self._controller: Optional[AutomationController] = None
         self._preview_timer: Optional[QTimer] = None
+        self._log_filter_level: int = logging.DEBUG
+        self._log_entries: Deque[Tuple[str, int, str]] = deque(maxlen=5000)
 
         self._build_ui()
         self._attach_log_handler()
@@ -93,7 +110,7 @@ class MainWindow(QMainWindow):
         missing = self.config_manager.missing_templates()
         if missing:
             if self.config.automation.auto_targeting:
-                self._append_log("INFO", "自动初始化已开启：缺失模板将使用 OCR 识别，无需先标定位置")
+                self._append_log("INFO", "启动时配置：自动初始化已开启；本轮实际模式以开始运行时的模式日志为准。缺失模板将使用 OCR，无需先标定位置")
                 self.statusBar().showMessage("自动初始化就绪，请在设备上打开竞技场页面", 8000)
             else:
                 self._append_log("WARNING", f"缺少模板文件: {', '.join(missing)}。可通过半自动配置生成模板")
@@ -146,6 +163,10 @@ class MainWindow(QMainWindow):
         self.auto_target_check.setToolTip("无需预先配置坐标，自动识别完整对手卡片、战力与挑战次数；点击规则与半自动配置一致。缺失模板时使用 OCR；无法可靠识别则安全停止。暂不自动滚动。")
         param_form.addRow(self.auto_target_check)
 
+        self.auto_save_check = QCheckBox("成功后保存配置")
+        self.auto_save_check.setToolTip("自动初始化确认进入备战页（或购买成功）后，把本次识别到的对手战力 ROI/点击坐标按参考分辨率写入当前配置文件。只更新 opponents，不改按钮、模板、购买或其它设置。")
+        param_form.addRow(self.auto_save_check)
+
         self.purchase_check = QCheckBox("自动购买挑战次数")
         self.auto_confirm_check = QCheckBox("自动确认购买")
         self.debug_check = QCheckBox("调试截图")
@@ -165,6 +186,12 @@ class MainWindow(QMainWindow):
         self.gpu_device_spin.setRange(0, 31)
         self.gpu_device_spin.setToolTip("DirectML 的 DXGI 显卡编号，通常为 0；不是 ADB 设备编号。")
         param_form.addRow("GPU 编号", self.gpu_device_spin)
+        self.ocr_lang_combo = QComboBox()
+        self.ocr_lang_combo.addItem("中文", "ch")
+        self.ocr_lang_combo.addItem("日语", "japan")
+        self.ocr_lang_combo.addItem("韩语", "korean")
+        self.ocr_lang_combo.setToolTip("切换语言后点保存并重启。RapidOCR 日语使用内置多语言模型、韩语首次自动安装韩文模型；EasyOCR 日/韩首次下载独立模型。模型存入程序本地 resources/models，不上传。")
+        param_form.addRow("OCR 语言", self.ocr_lang_combo)
         self.gpu_fallback_check = QCheckBox("GPU 不可用时回退 CPU")
         param_form.addRow(self.gpu_fallback_check)
 
@@ -333,9 +360,23 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_view)
         log_actions = QHBoxLayout()
         clear_log_btn = QPushButton("清空日志")
-        clear_log_btn.clicked.connect(self.log_view.clear)
+        clear_log_btn.clicked.connect(self._clear_log)
         log_actions.addWidget(clear_log_btn)
         log_actions.addStretch(1)
+        log_actions.addWidget(QLabel("日志等级:"))
+        self.log_level_combo = QComboBox()
+        self.log_level_combo.setToolTip(
+            "只过滤本页显示，不改变 logs/arena_auto.log；切换等级会重新显示缓冲区内的历史日志"
+        )
+        for label, level in (
+            ("全部", logging.DEBUG),
+            ("INFO", logging.INFO),
+            ("警告", logging.WARNING),
+            ("错误", logging.ERROR),
+        ):
+            self.log_level_combo.addItem(label, level)
+        self.log_level_combo.currentIndexChanged.connect(self._on_log_filter_changed)
+        log_actions.addWidget(self.log_level_combo)
         log_layout.addLayout(log_actions)
         right.addTab(log_tab, "日志")
 
@@ -364,17 +405,51 @@ class MainWindow(QMainWindow):
 
     def _append_log(self, level: str, message: str) -> None:
         # HH:MM:SS prefix on every GUI log line (CallbackHandler no longer adds asctime)
+        level_no = _log_level_value(level)
         ts = datetime.now().strftime("%H:%M:%S")
-        self.log_view.appendPlainText(f"[{ts}] {message}")
-        self.log_view.verticalScrollBar().setValue(
-            self.log_view.verticalScrollBar().maximum()
-        )
+        self._log_entries.append((ts, level_no, message))
+        if level_no >= self._log_filter_level:
+            self._write_log_lines([(ts, message)])
         if "OCR Ready" in message or "OCR 初始化中" in message:
             self.ocr_status_label.setText(
                 message if len(message) < 60 else "OCR: Ready"
             )
             if "OCR Ready" in message:
                 self.statusBar().showMessage("OCR Ready", 4000)
+
+    def _write_log_lines(self, entries: List[Tuple[str, str]]) -> None:
+        for ts, message in entries:
+            self.log_view.appendPlainText(f"[{ts}] {message}")
+        self.log_view.verticalScrollBar().setValue(
+            self.log_view.verticalScrollBar().maximum()
+        )
+
+    def _render_log_entries(self) -> None:
+        """Redraw the log page after a filter change, preserving history."""
+        visible = (
+            f"[{ts}] {message}"
+            for ts, level_no, message in self._log_entries
+            if level_no >= self._log_filter_level
+        )
+        self.log_view.setUpdatesEnabled(False)
+        try:
+            self.log_view.setPlainText("\n".join(visible))
+        finally:
+            self.log_view.setUpdatesEnabled(True)
+        self.log_view.verticalScrollBar().setValue(
+            self.log_view.verticalScrollBar().maximum()
+        )
+
+    def _on_log_filter_changed(self, index: int) -> None:
+        value = self.log_level_combo.itemData(index)
+        if value is None:
+            return
+        self._log_filter_level = int(value)
+        self._render_log_entries()
+
+    def _clear_log(self) -> None:
+        self._log_entries.clear()
+        self.log_view.clear()
 
     # ----------------------------------------------------------------- config
     def _load_config_into_form(self) -> None:
@@ -383,6 +458,7 @@ class MainWindow(QMainWindow):
         self.poll_spin.setValue(int(cfg.battle.poll_interval))
         self.dry_run_check.setChecked(cfg.automation.dry_run)
         self.auto_target_check.setChecked(cfg.automation.auto_targeting)
+        self.auto_save_check.setChecked(cfg.automation.auto_targeting_save_config)
         self.purchase_check.setChecked(cfg.purchase.enabled)
         self.auto_confirm_check.setChecked(cfg.purchase.auto_confirm)
         self.debug_check.setChecked(cfg.debug.enabled)
@@ -393,9 +469,17 @@ class MainWindow(QMainWindow):
         device = "directml" if cfg.ocr.device == "dml" else cfg.ocr.device
         self.ocr_device_combo.setCurrentText(device)
         self.gpu_device_spin.setValue(cfg.ocr.gpu_device_id)
+        lang_index = self.ocr_lang_combo.findData(cfg.ocr.lang)
+        if lang_index < 0:
+            self.ocr_lang_combo.addItem(f"{cfg.ocr.lang}（配置）", cfg.ocr.lang)
+            lang_index = self.ocr_lang_combo.findData(cfg.ocr.lang)
+        self.ocr_lang_combo.setCurrentIndex(lang_index)
         self.gpu_fallback_check.setChecked(cfg.ocr.gpu_fallback_to_cpu)
 
     def _apply_form_to_config(self) -> bool:
+        if self._automation_running():
+            self.statusBar().showMessage("运行中参数已锁定，请先停止再修改", 4000)
+            return False
         cfg = self.config
         text = self.threshold_edit.text().strip().replace(",", "")
         try:
@@ -418,12 +502,14 @@ class MainWindow(QMainWindow):
         cfg.automation.poll_interval = float(self.poll_spin.value())
         cfg.automation.dry_run = self.dry_run_check.isChecked()
         cfg.automation.auto_targeting = self.auto_target_check.isChecked()
+        cfg.automation.auto_targeting_save_config = self.auto_save_check.isChecked()
         cfg.purchase.enabled = self.purchase_check.isChecked()
         cfg.purchase.auto_confirm = self.auto_confirm_check.isChecked()
         cfg.debug.enabled = self.debug_check.isChecked()
         cfg.ocr.provider = self.provider_combo.currentText()
         cfg.ocr.scale = int(self.ocr_scale_spin.value())
         cfg.ocr.device = self.ocr_device_combo.currentText()
+        cfg.ocr.lang = str(self.ocr_lang_combo.currentData())
         cfg.ocr.gpu_device_id = self.gpu_device_spin.value()
         cfg.ocr.gpu_fallback_to_cpu = self.gpu_fallback_check.isChecked()
 
@@ -431,6 +517,7 @@ class MainWindow(QMainWindow):
         if serial == "未检测到 Android 设备":
             serial = ""
         cfg.adb.serial = serial
+        self.config_manager.config = cfg
         self.adb.update_config(cfg.adb)
         return True
 
@@ -702,7 +789,8 @@ class MainWindow(QMainWindow):
 
         self._automation_worker.state_changed.connect(self._on_state)
         self._automation_worker.screen_detected.connect(self._on_screen)
-        self._automation_worker.log_message.connect(self._append_log)
+        if not hasattr(self, "_log_handler"):
+            self._automation_worker.log_message.connect(self._append_log)
         self._automation_worker.powers_detected.connect(self._on_powers)
         self._automation_worker.target_changed.connect(self._on_target)
         self._automation_worker.challenge_changed.connect(self._on_challenge)
@@ -715,12 +803,14 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.save_cfg_btn.setEnabled(False)
         self.auto_target_check.setEnabled(False)
-        for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.gpu_fallback_check):
+        self.auto_save_check.setEnabled(False)
+        for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.ocr_lang_combo, self.gpu_fallback_check):
             control.setEnabled(False)
         # OCR loads on the automation worker thread — keep the GUI free.
         self.statusBar().showMessage("OCR 初始化中...")
         self.ocr_status_label.setText("OCR: 初始化中...")
-        self._append_log("INFO", "开始运行（OCR 于后台线程初始化）")
+        mode = "自动初始化" if self.config.automation.auto_targeting else "固定 ROI"
+        self._append_log("INFO", f"开始运行：{mode}（OCR 于后台线程初始化）")
         self._automation_thread.start()
 
     def _confirm_automation_start(self) -> bool:
@@ -728,6 +818,11 @@ class MainWindow(QMainWindow):
             mode = "测试模式：只记录操作，不会真实点击。" if self.config.automation.dry_run else "实际运行：将按识别结果执行点击。"
             purchase = (f"已开启，上限 {self.config.purchase.max_per_session} 次/会话"
                         if self.config.purchase.enabled else "已关闭")
+            save_config = (
+                "成功后自动写入对手 ROI/点击坐标"
+                if self.config.automation.auto_targeting_save_config
+                else "不自动写入配置"
+            )
             answer = QMessageBox.question(
                 self, "开始自动初始化",
                 "请先在设备上打开竞技场的选择对手页面。\n\n"
@@ -735,7 +830,7 @@ class MainWindow(QMainWindow):
                 "未找到模板时会使用 OCR，不必先执行半自动配置。\n"
                 "识别不可靠时安全停止，不会猜测坐标或胜负。\n\n"
                 f"战力阈值：{self.config.automation.power_threshold:,}\n"
-                f"自动购买：{purchase}\n{mode}\n\n是否开始？",
+                f"自动购买：{purchase}\n配置保存：{save_config}\n{mode}\n\n是否开始？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             return answer == QMessageBox.Yes
@@ -743,9 +838,10 @@ class MainWindow(QMainWindow):
         if missing:
             answer = QMessageBox.question(
                 self,
-                "缺少模板",
+                "固定 ROI 模式",
+                f"当前模式：固定 ROI（自动初始化未开启），将使用配置中已标定的对手 ROI/点击坐标。\n\n"
                 f"缺少模板文件: {', '.join(missing)}\n\n"
-                "可先使用半自动配置生成模板；部分按钮将依赖 OCR。仍要启动吗？",
+                "可先使用半自动配置生成模板；部分按钮将依赖 OCR。仍要以固定 ROI 模式启动吗？",
             )
             return answer == QMessageBox.Yes
         return True
@@ -762,7 +858,8 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.save_cfg_btn.setEnabled(True)
         self.auto_target_check.setEnabled(True)
-        for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.gpu_fallback_check):
+        self.auto_save_check.setEnabled(True)
+        for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.ocr_lang_combo, self.gpu_fallback_check):
             control.setEnabled(True)
         self.statusBar().showMessage("已停止")
         if self._automation_thread is not None:

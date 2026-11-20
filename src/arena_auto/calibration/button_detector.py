@@ -121,6 +121,12 @@ class ButtonDetector:
                 box = max(result_boxes, key=lambda b: (b.confidence, b.bbox[2] * b.bbox[3])) if result_boxes else None
             else:
                 box = self._best_box(keyword, boxes)
+                if name == "buy_challenge":
+                    # The dialog title and its purchase button can both match.
+                    # Prefer the short actual button, not a high-confidence title.
+                    candidates = [b for b in boxes if self._matches(keyword, b.text)]
+                    if candidates:
+                        box = min(candidates, key=lambda b: (len(normalize_ui_text(b.text)), -b.bbox[1], -b.confidence))
             if box is None:
                 logger.info("[CALIBRATION] 未找到「%s」", keyword)
                 continue

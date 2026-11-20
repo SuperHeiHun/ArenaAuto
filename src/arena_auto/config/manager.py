@@ -35,6 +35,7 @@ from arena_auto.models.config import (
     TemplateEntry,
     TimeoutSettings,
     split_ocr_text,
+    normalize_ocr_language,
 )
 from arena_auto.paths import get_config_path
 
@@ -234,6 +235,48 @@ class ConfigManager:
         except OSError as exc:
             raise ConfigError(f"无法写入配置: {exc}") from exc
 
+    def save_opponent_geometry(
+        self, updates: Dict[int, OpponentConfig]
+    ) -> List[int]:
+        """Persist auto-detected opponent ROI/click, preserving every other field.
+
+        Writing through a deep copy keeps the live config unchanged when the
+        YAML write fails. After a successful write, only the changed opponent
+        fields are mirrored into the existing object so GUI form references
+        stay valid.
+        """
+        if not updates:
+            return []
+        candidate = copy.deepcopy(self.config)
+        changed: List[int] = []
+        for opponent in candidate.opponents:
+            update = updates.get(opponent.id)
+            if update is None:
+                continue
+            opponent.power_region = tuple(int(v) for v in update.power_region)
+            opponent.click = tuple(int(v) for v in update.click)
+            opponent.source = update.source
+            opponent.confidence = float(update.confidence)
+            changed.append(opponent.id)
+        if not changed:
+            return []
+
+        ConfigManager(path=self.path, config=candidate).save()
+
+        live_by_id = {opponent.id: opponent for opponent in self.config.opponents}
+        saved_by_id = {opponent.id: opponent for opponent in candidate.opponents}
+        for opponent_id in changed:
+            live = live_by_id.get(opponent_id)
+            saved = saved_by_id[opponent_id]
+            if live is None:
+                continue
+            live.power_region = saved.power_region
+            live.click = saved.click
+            live.source = saved.source
+            live.confidence = saved.confidence
+        logger.info("已自动保存对手配置: %s -> %s", changed, self.path)
+        return changed
+
     def save_adb_serial(self, serial: str) -> None:
         """Write adb.serial into config.yaml (wireless IP:port auto-fill).
 
@@ -274,6 +317,9 @@ class ConfigManager:
             dry_run=bool(data["automation"].get("dry_run", False)),
             auto_targeting=bool(data["automation"].get("auto_targeting", False)),
             auto_targeting_max_attempts=max(1, int(data["automation"].get("auto_targeting_max_attempts", 2))),
+            auto_targeting_save_config=bool(
+                data["automation"].get("auto_targeting_save_config", True)
+            ),
         )
         recognition = RecognitionSettings(
             stable_reads=max(1, int(data["recognition"].get("stable_reads", 2))),
@@ -302,7 +348,7 @@ class ConfigManager:
             scale=max(1, int(ocr_raw.get("scale", 3))),
             threshold=bool(ocr_raw.get("threshold", True)),
             whitelist=str(ocr_raw.get("whitelist", "0123456789,")),
-            lang=str(ocr_raw.get("lang", "ch")),
+            lang=normalize_ocr_language(ocr_raw.get("lang", "ch")),
             dpi=int(ocr_raw.get("dpi", 300)),
             device=str(ocr_raw.get("device", "auto")),
             gpu_device_id=int(ocr_raw.get("gpu_device_id", 0)),

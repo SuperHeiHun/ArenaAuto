@@ -17,7 +17,7 @@ from arena_auto.recognition.ocr import parse_challenge_count
 
 logger = logging.getLogger(__name__)
 
-_CHALLENGE_KEYWORDS = ("可挑战", "挑战次数", "次数")
+_CHALLENGE_KEYWORDS = ("可挑战", "挑战次数", "次数", "도전 가능 횟수", "도전가능횟수")
 
 
 class RoiDetector:

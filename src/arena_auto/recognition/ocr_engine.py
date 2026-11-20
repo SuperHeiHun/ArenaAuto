@@ -237,8 +237,10 @@ class OcrEngine(OCRProvider):
 
     @classmethod
     def shared_provider_key(cls, settings: OcrSettings) -> Tuple[str, str, str, int, bool]:
+        from arena_auto.models.config import normalize_ocr_language
+
         device = str(getattr(settings, "device", "auto") or "auto").lower()
-        return (str(settings.provider).lower(), str(settings.lang), device,
+        return (str(settings.provider).lower(), normalize_ocr_language(settings.lang), device,
                 settings.gpu_device_id, settings.gpu_fallback_to_cpu)
 
     @classmethod

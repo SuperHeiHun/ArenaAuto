@@ -5,5 +5,6 @@ numpy>=1.24,<3
 PyYAML>=6,<7
 opencv-python-headless>=4.8,<5
 -r requirements-gpu.txt
+# PyTorch/EasyOCR remain optional and are intentionally excluded from the lean GPU desktop bundle.
 pyinstaller==6.22.2
 pytest>=7.4,<10

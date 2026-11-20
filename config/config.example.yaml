@@ -4,11 +4,13 @@ version: 2
 
 automation:
   auto_targeting: true   # UI: 自动初始化；旧键保留兼容
+  auto_targeting_save_config: true  # UI: 成功后保存配置（进入备战/购买成功后写入对手 ROI 与点击）
   power_threshold: 2000000
 
 ocr:
   # 引擎：rapidocr | easyocr | paddle | tesseract
   provider: rapidocr
+  lang: ch                 # ch | japan | korean
   # 设备：auto | cpu | directml (RapidOCR) | cuda (EasyOCR)
   device: auto
   gpu_device_id: 0
@@ -18,3 +20,16 @@ ocr:
   timeout_ms: 1500       # 软预算，只告警，不中断识别
   power_allowlist: "0123456789,."
   challenge_allowlist: "0123456789/"
+
+# Defaults include Chinese + Korean UI text; a Korean-capable OCR model is still
+# required to read Hangul. Existing per-user overrides are not merged silently.
+profile:
+  arena_title_keywords: ["胜利者的竞技场", "승자의 줘팸터"]
+  arena_select_keywords: ["请选择对手", "대전 상대를 선택하여 주세요"]
+  challenge_keywords: ["可挑战次数", "도전 가능 횟수"]
+  go_win_text: "去获胜,이기러 간다"
+  exit_text: "退出,나가기"
+  victory_text: "胜利,VICTORY"
+  defeat_text: "失败,DEFEAT"
+  buy_text: "购买挑战次数,도전 횟수 구매,구매"
+  confirm_text: "确认,확인"

@@ -52,6 +52,10 @@ jobs:
         shell: pwsh
         run: python main.py --self-test --report debug/source-runtime.json
 
+      - name: Download checksum-verified Korean OCR model for the release bundle
+        shell: pwsh
+        run: python scripts/install_language_models.py --languages korean --engines rapidocr
+
       - name: Build GPU-capable EXE
         shell: pwsh
         run: python scripts/build.py
@@ -76,6 +80,21 @@ jobs:
             throw "Packaged models or runtime are invalid"
           }
           Get-Content $report
+          $koreanReport = Join-Path $env:RUNNER_TEMP "arenaauto-packaged-korean-runtime.json"
+          $korean = Start-Process -FilePath $exe -ArgumentList @("--self-test", "--language", "korean", "--report", "`"$koreanReport`"") -PassThru
+          if (-not $korean.WaitForExit(180000)) {
+            $korean.Kill()
+            throw "Packaged Korean OCR model test timed out"
+          }
+          $korean.WaitForExit()
+          if ($korean.ExitCode -ne 0 -or -not (Test-Path $koreanReport)) {
+            throw "Packaged Korean OCR model test failed (exit $($korean.ExitCode))"
+          }
+          $kr = Get-Content $koreanReport -Raw | ConvertFrom-Json
+          if (-not $kr.ok -or $kr.language -ne "korean" -or $kr.model_count -ne 2) {
+            throw "Packaged Korean OCR models failed validation"
+          }
+          Get-Content $koreanReport
 
       - name: Package release ZIP
         shell: pwsh

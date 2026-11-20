@@ -12,6 +12,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--language", choices=("ch", "japan", "korean"), default="ch")
     args = parser.parse_args(argv)
     report = {"ok": False, "device_actions": 0, "frozen": bool(getattr(sys, "frozen", False))}
     try:
@@ -24,7 +25,8 @@ def main(argv=None) -> int:
 
         # Hosted CI runners do not need a GPU: load and run the exact bundled
         # models with CPU EP, rather than merely checking that DLLs exist.
-        provider = RapidOCRProvider(OcrSettings(provider="rapidocr", device="cpu", gpu_fallback_to_cpu=False))
+        provider = RapidOCRProvider(OcrSettings(provider="rapidocr", lang=args.language,
+                                                device="cpu", gpu_fallback_to_cpu=False))
         image = np.full((100, 360, 3), 255, dtype=np.uint8)
         cv2.putText(image, "12345", (25, 70), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 4)
         boxes = provider.recognize(image)
@@ -33,7 +35,7 @@ def main(argv=None) -> int:
         if not all(path.is_file() for path in provider._model_paths):
             raise RuntimeError("打包 OCR 模型文件缺失")
         defaults = ConfigManager.initial_config()
-        report.update(ok=True, provider=provider.name, device=provider.device_label,
+        report.update(ok=True, language=args.language, provider=provider.name, device=provider.device_label,
                       session_providers=provider.session_providers, texts=[b.text for b in boxes],
                       model_count=len(provider._model_paths),
                       default_auto_initialize=defaults.automation.auto_targeting,

@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
+from enum import Enum
 from unittest.mock import MagicMock
 
 import cv2
@@ -28,7 +29,7 @@ def runtime(monkeypatch, tmp_path):
     (root / "models").mkdir(parents=True)
     for name in ("PP-OCRv6_det_small.onnx", "PP-OCRv6_rec_small.onnx"):
         (root / "models" / name).write_bytes(b"test-model")
-    state = SimpleNamespace(sessions=[], engines=[], fail_at=None, cpu_only_at=None,
+    state = SimpleNamespace(root=root, sessions=[], engines=[], fail_at=None, cpu_only_at=None,
                             available=["DmlExecutionProvider", "CPUExecutionProvider"])
 
     class Session:
@@ -53,6 +54,21 @@ def runtime(monkeypatch, tmp_path):
         def __init__(self, params):
             state.engines.append(self)
             self.params = params
+            class Version(Enum):
+                V4 = "PP-OCRv4"
+                V5 = "PP-OCRv5"
+                V6 = "PP-OCRv6"
+            class Language(Enum):
+                CH = "ch"
+                JAPAN = "japan"
+                KOREAN = "korean"
+            class Model(Enum):
+                MOBILE = "mobile"
+                SMALL = "small"
+            self.cfg = SimpleNamespace(
+                Det=SimpleNamespace(ocr_version=Version.V6, lang_type=Language.CH, model_type=Model.SMALL),
+                Rec=SimpleNamespace(ocr_version=Version.V6, lang_type=Language.CH, model_type=Model.SMALL),
+            )
             self.det = SimpleNamespace(session=SimpleNamespace(session=Session()))
             self.rec = SimpleNamespace(session=SimpleNamespace(session=Session()))
             self.calls = []
@@ -77,14 +93,40 @@ def runtime(monkeypatch, tmp_path):
     rapid = ModuleType("rapidocr")
     rapid.__file__ = str(root / "__init__.py")
     rapid.RapidOCR = Engine
+    utils = ModuleType("rapidocr.utils")
+    typings = ModuleType("rapidocr.utils.typings")
+    # Explicit test enums are attached after module creation by the provider's
+    # own enum import path; every member must still derive from Enum.
+    class OCRVersion(Enum):
+        PPOCRV4 = "PP-OCRv4"
+        PPOCRV5 = "PP-OCRv5"
+        PPOCRV6 = "PP-OCRv6"
+    class LangDet(Enum):
+        CH = "ch"
+        MULTI = "multi"
+    class LangRec(Enum):
+        CH = "ch"
+        JAPAN = "japan"
+        KOREAN = "korean"
+    class ModelType(Enum):
+        MOBILE = "mobile"
+        SMALL = "small"
+    typings.OCRVersion, typings.LangDet = OCRVersion, LangDet
+    typings.LangRec, typings.ModelType = LangRec, ModelType
+    utils.typings = typings
+    rapid.utils = utils
     ort = ModuleType("onnxruntime")
     ort.get_available_providers = lambda: list(state.available)
     ort.SessionOptions = SimpleNamespace
     ort.ExecutionMode = SimpleNamespace(ORT_SEQUENTIAL="sequential")
     ort.InferenceSession = Session
     monkeypatch.setitem(sys.modules, "rapidocr", rapid)
+    monkeypatch.setitem(sys.modules, "rapidocr.utils", utils)
+    monkeypatch.setitem(sys.modules, "rapidocr.utils.typings", typings)
     monkeypatch.setitem(sys.modules, "onnxruntime", ort)
     monkeypatch.setattr("arena_auto.recognition.rapidocr_provider.platform.system", lambda: "Windows")
+    monkeypatch.setattr("arena_auto.recognition.rapidocr_provider.get_resource_path", lambda name: root.parent / "bundle" / "resources" / "models" / "rapidocr")
+    monkeypatch.setattr("arena_auto.recognition.rapidocr_provider.get_writable_path", lambda name: root.parent / "writable" / "resources" / "models" / "rapidocr")
     return state
 
 
@@ -141,6 +183,29 @@ def test_cpu_selection_does_not_attempt_gpu(runtime):
     assert not runtime.sessions
 
 
+@pytest.mark.parametrize("language,expected", [("japan", "japan"), ("korean", "korean")])
+def test_rapidocr_language_routes_recognizer_model(runtime, monkeypatch, language, expected):
+    import hashlib
+    from arena_auto.recognition import rapidocr_provider
+    files = (("det.onnx", "deterministic detector"), ("rec.onnx", f"{language} recognizer"))
+    bundled = runtime.root.parent / "bundle" / "resources" / "models" / "rapidocr"
+    bundled.mkdir(parents=True)
+    specs = []
+    for name, content in files:
+        path = bundled / name
+        path.write_text(content, encoding="utf-8")
+        specs.append((name, f"https://models.example/{name}", hashlib.sha256(path.read_bytes()).hexdigest()))
+    if language == "korean":
+        monkeypatch.setattr(rapidocr_provider, "KOREAN_MODELS", tuple(specs))
+    config = OcrSettings(provider="rapidocr", lang=language, device="directml")
+    provider = RapidOCRProvider(config)
+    engine = runtime.engines[-1]
+    assert engine.cfg.Rec.ocr_version.value == ("PP-OCRv5" if language == "korean" else "PP-OCRv6")
+    assert engine.cfg.Rec.lang_type.value == expected
+    assert engine.cfg.Det.lang_type.value == ("ch" if language == "korean" else "multi")
+    assert provider.device_label == "DirectML GPU 0"
+
+
 def test_runtime_gpu_failure_retries_once_on_cpu(runtime):
     provider = RapidOCRProvider(settings())
     provider._engine.error_count = 1
@@ -194,6 +259,25 @@ def test_actual_device_label_updates_in_facade_after_fallback(runtime):
     provider._engine.error_count = 1
     engine.recognize(np.zeros((20, 40, 3), dtype=np.uint8))
     assert engine.get_stats()["device"] == "CPU"
+
+
+def test_easyocr_creates_and_reuses_separate_language_readers(monkeypatch, tmp_path):
+    import types
+    from arena_auto.recognition.ocr import EasyOCRProvider
+    fake = types.ModuleType("easyocr")
+    calls = []
+    fake.Reader = lambda langs, **kwargs: calls.append((tuple(langs), kwargs)) or object()
+    monkeypatch.setitem(sys.modules, "easyocr", fake)
+    monkeypatch.setattr(EasyOCRProvider, "_ensure_easyocr_language_model", classmethod(lambda cls, language: tmp_path))
+    EasyOCRProvider.reset_shared_reader()
+    korean = EasyOCRProvider(OcrSettings(lang="korean", device="cpu"))
+    korean_again = EasyOCRProvider(OcrSettings(lang="korean", device="cpu"))
+    japanese = EasyOCRProvider(OcrSettings(lang="japan", device="cpu"))
+    assert korean._reader is korean_again._reader
+    assert japanese._reader is not korean._reader
+    assert [c[0] for c in calls] == [("ko", "en"), ("ja", "en")]
+    assert all(c[1]["model_storage_directory"] == str(tmp_path) for c in calls)
+    EasyOCRProvider.reset_shared_reader()
 
 
 def test_gpu_policy_and_device_id_participate_in_shared_identity():

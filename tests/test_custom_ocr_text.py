@@ -153,7 +153,7 @@ def test_main_window_applies_only_after_successful_save(qt_app, monkeypatch, tmp
         monkeypatch.setattr(ConfigManager, "save", MagicMock(side_effect=OSError("write failed")))
     try:
         window.open_ocr_text_settings()
-        assert original.profile.go_win_text == "去获胜"
+        assert original.profile.go_win_text == ArenaProfile().go_win_text
         if save_fails:
             assert window.config is original
             assert manager.config is original
