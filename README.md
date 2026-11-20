@@ -526,12 +526,14 @@ python scripts/benchmark_ocr.py --repeat 3
 ```bash
 pip install pyinstaller
 python scripts/build.py
-# 或
-pyinstaller ArenaAuto.spec
+# 或（仅执行 PyInstaller，不检查产物）
+pyinstaller --clean ArenaAuto.spec
 ```
 
 产物：`dist/ArenaAuto/`（含 `ArenaAuto.exe`）。  
 包内包含通用资源以及已安装的 RapidOCR/ONNX Runtime DLL 与 OCR 模型。不会打入开发者的 `config/`、ZIP 备份或 `resources/templates/generated/` 本地截图；首次启动在 exe 同级生成干净配置，模板、日志、debug、data 也放在 exe 同级目录。
+
+推荐使用 `scripts/build.py`：每次干净构建，并检查 EXE 内嵌图标、GUI 子系统及随包窗口图标。Windows 下启动 ADB / Tesseract 子进程会禁用控制台窗口，避免弹出 CMD。如果资源管理器或任务栏仍显示旧图标，可把新包完整解压到新目录，并重新固定对应的程序。不要只复制 `ArenaAuto.exe`，它需要同目录的 `_internal`。
 
 ### GitHub Actions 构建与发布
 

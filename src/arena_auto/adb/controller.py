@@ -19,6 +19,7 @@ from arena_auto.exceptions import (
     ScreenshotError,
 )
 from arena_auto.models.config import AdbConfig
+from arena_auto.process_utils import no_console_window_options
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,7 @@ class AdbController:
                 capture_output=True,
                 timeout=timeout,
                 check=False,
+                **no_console_window_options(),
             )
         except FileNotFoundError as exc:
             raise AdbNotFoundError(str(exc)) from exc

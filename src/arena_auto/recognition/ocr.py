@@ -13,6 +13,7 @@ import numpy as np
 from arena_auto.exceptions import OCRProviderError
 from arena_auto.models.config import OcrSettings
 from arena_auto.models.recognition import OCRBox, Region
+from arena_auto.process_utils import no_console_window_options
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +240,29 @@ class PaddleOCRProvider(OCRProvider):
         return _parse_paddle_result(result)
 
 
+class _TesseractSubprocess:
+    """Wrap only pytesseract's subprocess reference, not the stdlib module.
+
+    Its version and language probes bypass the helper used for recognition.
+    Cover all three launch methods without changing its pipes or startupinfo.
+    """
+
+    def __init__(self, module, creationflags: int) -> None:
+        self._module = module
+        self._creationflags = creationflags
+
+    def __getattr__(self, name):
+        original = getattr(self._module, name)
+        if name not in ("Popen", "run", "check_output"):
+            return original
+
+        def launch(*args, **kwargs):
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | self._creationflags
+            return original(*args, **kwargs)
+
+        return launch
+
+
 class TesseractOCRProvider(OCRProvider):
     """pytesseract backend."""
 
@@ -250,6 +274,12 @@ class TesseractOCRProvider(OCRProvider):
             import pytesseract  # type: ignore
         except Exception as exc:  # noqa: BLE001
             raise OCRProviderError(f"pytesseract 不可用: {exc}") from exc
+        options = no_console_window_options()
+        if options:
+            implementation = pytesseract.pytesseract
+            child_processes = implementation.subprocess
+            if not isinstance(child_processes, _TesseractSubprocess):
+                implementation.subprocess = _TesseractSubprocess(child_processes, options["creationflags"])
         try:
             pytesseract.get_tesseract_version()
         except Exception as exc:  # noqa: BLE001
