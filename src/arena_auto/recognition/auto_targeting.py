@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import statistics
+import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
 
@@ -390,12 +391,39 @@ class AutoTargeting:
                 if abs(y1 - y2) <= max(3, height * 0.005)
                 and min(x1, x2) <= card_width * 0.04 and max(x1, x2) >= card_width * 0.96]
 
-    def select(self, screenshot_factory: Callable[[], np.ndarray], threshold: int, stop_event=None):
+    def select(self, screenshot_factory: Callable[[], np.ndarray], threshold: int, stop_event=None,
+               *, layout_hint: Optional[np.ndarray] = None):
         """One layout discovery, then short-circuit stable ROI reads on new frames."""
         for attempt in range(max(1, self.config.recognition.retry_count)):
             self._check_stop(stop_event)
+            confirmation_frame = None
             try:
-                cards = self.scan(screenshot_factory())
+                if layout_hint is not None:
+                    hint, layout_hint = layout_hint, None  # One attempt, never a persistent cross-round cache.
+                    cards = self.scan(hint)
+                    started = time.perf_counter()
+                    confirmation_frame = screenshot_factory()
+                    capture_ms = (time.perf_counter() - started) * 1000.0
+                    self._check_stop(stop_event)
+                    from arena_auto.recognition.frame_guard import regions_unchanged
+
+                    ordered = [c.opponent.id for c in cards] == list(range(1, len(cards) + 1))
+                    # Validate the whole list-side panel, including title and
+                    # edges/tail, not only the ultimately selected card.
+                    left = max(0, min((c.region[0] for c in cards), default=0) - 32)
+                    region = (left, 0, hint.shape[1] - left, hint.shape[0])
+                    started = time.perf_counter()
+                    unchanged = cards and ordered and regions_unchanged(hint, confirmation_frame, [region])
+                    logger.info("布局验证耗时：新截图 %.0fms；画面校验 %.0fms；复用=%s",
+                                capture_ms, (time.perf_counter() - started) * 1000.0, bool(unchanged))
+                    if unchanged:
+                        logger.info("布局复用：新截图已验证整个列表区域，跳过重复整图 OCR")
+                        self.last_image = confirmation_frame
+                    else:
+                        logger.info("布局复用未通过：画面/列表变化，回退新截图整图 OCR")
+                        cards = self.scan(confirmation_frame)
+                else:
+                    cards = self.scan(screenshot_factory())
             except OCRFailedError as exc:
                 self.last_reason = str(exc)
                 logger.warning("自动选点布局尝试 %s: %s", attempt + 1, exc)
@@ -411,7 +439,9 @@ class AutoTargeting:
                 for expected, card in enumerate(cards, 1):
                     if card.opponent.id != expected:
                         raise OCRFailedError("前序对手卡片识别不完整，禁止跳过选择")
-                    value, latest = self._confirm_card(card, screenshot_factory, stop_event)
+                    value, latest = self._confirm_card(card, screenshot_factory, stop_event,
+                                                       first_frame=confirmation_frame)
+                    confirmation_frame = None
                     card.opponent.power = value
                     card.power_verified = True
                     confirmed.append(card.opponent)
@@ -431,17 +461,28 @@ class AutoTargeting:
         if stop_event is not None and stop_event.is_set():
             raise StoppedError("用户停止")
 
-    def _confirm_card(self, card, screenshot_factory, stop_event):
+    def _confirm_card(self, card, screenshot_factory, stop_event, *, first_frame=None):
         needed = max(2, self.config.recognition.stable_reads)
         previous, streak = None, 0
         for read in range(max(needed, self.config.recognition.retry_count)):
             self._check_stop(stop_event)
-            image = screenshot_factory()
+            prefetched = first_frame is not None
+            started = time.perf_counter()
+            if first_frame is not None:
+                image, first_frame = first_frame, None
+            else:
+                image = screenshot_factory()
+            capture_ms = (time.perf_counter() - started) * 1000.0
             if not self.verify_target(image, card.opponent):
                 raise OCRFailedError(f"#{card.opponent.id} 卡片画面已变化，可能刷新或滚动")
+            started = time.perf_counter()
             value = self._read_power(image, card.opponent.power_region)
+            read_ms = (time.perf_counter() - started) * 1000.0
             self._check_stop(stop_event)
             logger.info("自动选点 #%s 数字 ROI 第 %s 次: %s", card.opponent.id, read + 1, value if value is not None else "OCR_FAILED")
+            logger.info("战力复核耗时 #%s 第%s次：截图 %.0fms；ROI读取 %.0fms%s",
+                        card.opponent.id, read + 1, capture_ms, read_ms,
+                        "（首帧已在布局验证时获取）" if prefetched else "")
             streak = streak + 1 if value is not None and value == previous else 1 if value is not None else 0
             previous = value
             if streak >= needed:
@@ -456,6 +497,7 @@ class AutoTargeting:
                 boxes, _ = self.ocr.read_roi(image, region, allowlist=self.config.ocr.power_allowlist,
                                             preprocess=True, cache_key=None, force=True)
                 if not any(b.confidence >= 0.5 and parse_power(b.text) is not None for b in boxes):
+                    logger.info("战力 ROI 预处理未得到可靠数字，重试原图")
                     # Retry the original crop, rather than repeating the same
                     # thresholded input; keep RapidOCR's single-line fast path.
                     boxes2, _ = self.ocr.read_roi(image, region, allowlist=self.config.ocr.power_allowlist,

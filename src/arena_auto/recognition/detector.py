@@ -954,6 +954,7 @@ class ButtonFinder:
         self.config = config
         self.debug = debug
         self.engine = _as_engine(ocr, config)
+        self.frame_cache = None
 
     def _region_hint(self, name: str) -> Optional[Region]:
         geo = self.config.button_geometry(name)
@@ -970,6 +971,11 @@ class ButtonFinder:
         return find_text_boxes(self.ocr, image, keyword)
 
     def _find_ocr_boxes(self, image: np.ndarray, text: str, template_name: str) -> List[OCRBox]:
+        cached = self.frame_cache.peek(image) if self.frame_cache is not None else None
+        if cached is not None:
+            if template_name in ("victory", "defeat"):
+                return find_result_text_boxes(cached, text, companions=self.config.profile.exit_text)
+            return [b for b in cached if b.confidence >= 0.3 and matches_ocr_text(text, b.text)]
         if template_name not in ("victory", "defeat"):
             return find_text_boxes(self.ocr, image, text)
         try:
@@ -977,6 +983,25 @@ class ButtonFinder:
         except Exception as exc:  # noqa: BLE001
             logger.warning("结算文案 OCR 失败: %s", exc)
             return []
+
+    def _inside_region_hint(self, screenshot, result, template_name):
+        hint = self._region_hint(template_name)
+        if hint is None:
+            return True
+        scaler = CoordinateScaler(self.config.screen.reference_width, self.config.screen.reference_height)
+        scaler.maybe_update_from_image(screenshot)
+        x, y, w, h = scaler.scale_region(hint)
+        cx, cy = result.center
+        return x <= cx < x + w and y <= cy < y + h
+
+    def cached_go_win(self, screenshot):
+        """Return only already computed OCR evidence; never recognize old pixels."""
+        if self.frame_cache is None or self.frame_cache.peek(screenshot) is None:
+            return None
+        result = self._full_ocr_result(screenshot, self.config.profile.go_win_text, "go_win")
+        if result is not None and self._inside_region_hint(screenshot, result, "go_win"):
+            return result
+        return None
 
     def find(
         self,
@@ -1004,6 +1029,14 @@ class ButtonFinder:
 
         keywords = split_ocr_text(fallback_text)
         if keywords:
+            if full_ocr and self.frame_cache is not None and self.frame_cache.peek(screenshot) is not None:
+                result = self._full_ocr_result(screenshot, fallback_text, template_name)
+                # Preserve an explicit configured ROI preference. A cached
+                # whole-frame label is a shortcut only if its center is inside
+                # that ROI; otherwise run the existing ROI-first path.
+                if result is not None and self._inside_region_hint(screenshot, result, template_name):
+                    logger.info("按钮复用同帧 OCR：%s", template_name)
+                    return result
             hint = self._region_hint(template_name)
             if hint is not None:
                 try:
@@ -1062,44 +1095,13 @@ class ButtonFinder:
                 )
 
             full_started = time.perf_counter()
-            boxes = self._find_ocr_boxes(screenshot, fallback_text, template_name)
+            result = self._full_ocr_result(screenshot, fallback_text, template_name)
             perf_log(
                 f"Button {template_name} (full ocr)",
                 (time.perf_counter() - full_started) * 1000.0,
             )
-            if boxes:
-                # 短关键字（确认/购买等）不要匹配更长句子（确认对手布置）
-                boxes = [
-                    b for b in boxes
-                    if any(
-                        matches_ocr_text(keyword, b.text)
-                        and (len(normalize_ui_text(keyword)) > 2
-                             or len(normalize_ui_text(b.text)) <= len(normalize_ui_text(keyword)) + 1)
-                        for keyword in keywords
-                    )
-                ]
-                if boxes:
-                    normalized_keywords = {normalize_ui_text(k) for k in keywords}
-                    exact = [b for b in boxes if normalize_ui_text(b.text) in normalized_keywords]
-                    # 标题=完整关键字、按钮=更短子串：优先更短标签，再靠下(按钮在标题下)，再置信度
-                    if exact and len(exact) == len(boxes):
-                        box = max(exact, key=lambda b: b.confidence)
-                    else:
-                        box = max(
-                            boxes,
-                            key=lambda b: (
-                                -len(b.text.strip()),
-                                b.bbox[1],
-                                b.confidence,
-                            ),
-                        )
-                    logger.debug("OCR fallback 命中 %s -> %s", template_name, box.text)
-                    return DetectionResult(
-                        found=True,
-                        confidence=box.confidence,
-                        bbox=box.bbox,
-                        template_name=f"{template_name}#ocr",
-                    )
+            if result is not None:
+                return result
 
         if self.debug is not None:
             self.debug.save_failed(screenshot, name=f"miss_{template_name}")
@@ -1108,6 +1110,23 @@ class ButtonFinder:
         perf_log(f"Button {template_name} (miss)", elapsed)
         logger.debug("按钮未找到: %s", template_name)
         return DetectionResult(found=False, confidence=0.0, template_name=template_name)
+
+    def _full_ocr_result(self, screenshot, text, template_name):
+        keywords = split_ocr_text(text)
+        # Preserve the original short-keyword exclusion and candidate ordering
+        # for cached evidence as well as actual full-frame recognition.
+        boxes = [b for b in self._find_ocr_boxes(screenshot, text, template_name)
+                 if any(matches_ocr_text(k, b.text)
+                        and (len(normalize_ui_text(k)) > 2
+                             or len(normalize_ui_text(b.text)) <= len(normalize_ui_text(k)) + 1)
+                        for k in keywords)]
+        if not boxes:
+            return None
+        normalized = {normalize_ui_text(k) for k in keywords}
+        exact = [b for b in boxes if normalize_ui_text(b.text) in normalized]
+        box = (max(exact, key=lambda b: b.confidence) if len(exact) == len(boxes)
+               else max(boxes, key=lambda b: (-len(b.text.strip()), b.bbox[1], b.confidence)))
+        return DetectionResult(True, box.confidence, box.bbox, f"{template_name}#ocr")
 
     def find_go_win(self, screenshot: np.ndarray) -> DetectionResult:
         return self.find(screenshot, "go_win", self.config.profile.go_win_text)

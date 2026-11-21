@@ -88,6 +88,8 @@ class _RuntimeContext:
     layout_frame: Optional[np.ndarray] = None
     layout_frame_at: float = 0.0
     arena_frame: Optional[np.ndarray] = None
+    prepare_frame: Optional[np.ndarray] = None
+    prepare_frame_at: float = 0.0
     result_scene_change: SettledSceneChange = field(default_factory=SettledSceneChange)
 
 
@@ -146,6 +148,7 @@ class AutomationController:
         # Manual ROI mode retains its original page recognition path.
         self.detector.frame_cache = self.frame_cache if self.config.automation.auto_targeting else None
         self.auto_targeting.frame_cache = self.frame_cache
+        self.buttons.frame_cache = self.frame_cache if self.config.automation.auto_targeting else None
 
     @property
     def is_running(self) -> bool:
@@ -210,6 +213,7 @@ class AutomationController:
         self._attach_frame_cache()
         self.ctx.layout_frame = None
         self.ctx.arena_frame = None
+        self.ctx.prepare_frame = None
         try:
             from arena_auto.recognition.ocr_engine import set_performance_logging
 
@@ -374,6 +378,7 @@ class AutomationController:
         self.detector.invalidate_frame_cache()
         self.ctx.layout_frame = None
         self.ctx.arena_frame = None
+        self.ctx.prepare_frame = None
         self._log("INFO", f"点击 ({x},{y}) {label}".rstrip())
         self.adb.tap(x, y, delay=delay)
 
@@ -383,6 +388,7 @@ class AutomationController:
         self.frame_cache.clear()
         self.ctx.layout_frame = None
         self.ctx.arena_frame = None
+        self.ctx.prepare_frame = None
         image = self.adb.screenshot()
         elapsed = (time.perf_counter() - started) * 1000.0
         try:
@@ -550,8 +556,16 @@ class AutomationController:
                 self.ctx.layout_frame = None
                 # Only discovery may reuse the immediately preceding arena
                 # frame. All numeric reads and pre-tap validation stay fresh.
-                if time.monotonic() - self.ctx.layout_frame_at > 1.0:
+                age = time.monotonic() - self.ctx.layout_frame_at
+                layout_hint = None
+                if layout_frame is not None and 1.0 < age <= 5.0:
+                    layout_hint, layout_frame = layout_frame, None
+                    self._log("INFO", f"布局缓存年龄 {age:.2f}s：尝试新截图验证后复用")
+                elif age > 5.0:
                     layout_frame = None
+                    self._log("INFO", f"布局缓存过期 {age:.2f}s：重新整图定位")
+                elif layout_frame is not None:
+                    self._log("INFO", f"布局复用同帧 OCR（年龄 {age:.2f}s）")
 
                 def selection_factory():
                     nonlocal layout_frame
@@ -562,7 +576,12 @@ class AutomationController:
                         return image
                     return factory()
 
-                opponents, selected = self.auto_targeting.select(selection_factory, threshold, self.stop_event)
+                if layout_hint is not None:
+                    opponents, selected = self.auto_targeting.select(
+                        selection_factory, threshold, self.stop_event, layout_hint=layout_hint
+                    )
+                else:
+                    opponents, selected = self.auto_targeting.select(selection_factory, threshold, self.stop_event)
                 if self.auto_targeting.last_image is not None:
                     overlay = self.auto_targeting.draw(self.auto_targeting.last_image)
                     self.debug.save(overlay, category="arena", tag="auto_targeting")
@@ -746,6 +765,9 @@ class AutomationController:
             self._log("INFO", "当前页面：PREPARE")
             self._save_auto_targeting_config()
             self.ctx.auto_selection_attempts = 0
+            if self.config.automation.auto_targeting:
+                self.ctx.prepare_frame = image
+                self.ctx.prepare_frame_at = self.ctx.screenshot_at
             self.sm.transition(AutomationState.PREPARE)
             return
         if kind == ScreenKind.PURCHASE and self.config.automation.auto_targeting:
@@ -768,8 +790,23 @@ class AutomationController:
 
     def _state_prepare(self) -> None:
         timeout = self.config.timeouts.start_battle
+        old_frame = self.ctx.prepare_frame
+        self.ctx.prepare_frame = None
+        observed_button = None
+        if (old_frame is not None and time.monotonic() - self.ctx.prepare_frame_at <= 5.0
+                and self.frame_cache.peek(old_frame) is not None):
+            # Read evidence before _shot invalidates the same-frame OCR cache.
+            observed_button = self.buttons.cached_go_win(old_frame)
         image = self._shot()
-        result = self.buttons.find_go_win(image)
+        from arena_auto.recognition.frame_guard import regions_unchanged
+
+        if (observed_button is not None and observed_button.found
+                and regions_unchanged(old_frame, image,
+                                      [(0, 0, image.shape[1], image.shape[0]), observed_button.bbox])):
+            result = observed_button
+            self._log("INFO", "备战按钮复用：新截图验证页面未变化，跳过重复 OCR")
+        else:
+            result = self.buttons.find_go_win(image)
         if result.found:
             self._log("INFO", "检测到「去获胜」")
             self.ctx.auto_selection_attempts = 0

@@ -39,6 +39,14 @@ class FrameOCRCache:
         self._raw = None
         self._result = None
 
+    def peek(self, image: np.ndarray):
+        """Read already computed same-frame evidence without starting OCR."""
+        if image is not self._image:
+            return None
+        if self._result is not None:
+            return list(self._result.boxes)
+        return list(self._raw) if self._raw is not None else None
+
     def raw(self, image: np.ndarray) -> List[OCRBox]:
         if image is not self._image:
             self.clear()

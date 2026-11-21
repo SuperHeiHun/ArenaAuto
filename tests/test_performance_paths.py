@@ -99,7 +99,7 @@ def test_controller_shares_detection_arena_and_discovery_frame(tmp_path):
     assert ctrl.ctx.layout_frame is frame
     ctrl.auto_targeting.detect_cards = MagicMock(return_value=[])
 
-    def select(factory, threshold, stop_event):
+    def select(factory, threshold, stop_event, **kwargs):
         ctrl.auto_targeting.scan(factory())
         return [], None
 
@@ -126,7 +126,7 @@ def test_slow_challenge_ocr_does_not_make_an_old_frame_fresh(tmp_path, monkeypat
     frame = ctrl.ctx.layout_frame
     seen = []
 
-    def select(factory, threshold, stop_event):
+    def select(factory, threshold, stop_event, **kwargs):
         seen.append(factory())
         return [], None
 
@@ -146,7 +146,7 @@ def test_arena_frame_reuse_is_layout_only_and_expires(tmp_path, expired):
         ctrl.ctx.layout_frame_at = time.monotonic() - 2
     observed = []
 
-    def select(factory, threshold, stop_event):
+    def select(factory, threshold, stop_event, **kwargs):
         observed.extend([factory(), factory(), factory()])
         return [], None
 

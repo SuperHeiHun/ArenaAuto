@@ -398,12 +398,14 @@ class OcrEngine(OCRProvider):
                     return list(cached.boxes), cached.text
                 return list(cached.boxes), cached.text
 
+        preprocess_started = time.perf_counter()
         work = roi
         if preprocess:
             try:
                 work = preprocess_for_ocr(roi, self.settings)
             except Exception:  # noqa: BLE001
                 work = roi
+        preprocess_ms = (time.perf_counter() - preprocess_started) * 1000.0
 
         kwargs: Dict[str, Any] = {}
         if allowlist and getattr(self.provider, "supports_read_kwargs", False):
@@ -428,6 +430,7 @@ class OcrEngine(OCRProvider):
         except Exception as exc:  # noqa: BLE001
             elapsed = (time.perf_counter() - started) * 1000.0
             self.monitor.record(elapsed, ok=False)
+            logger.info("OCR ROI 耗时：预处理 %.0fms；推理/等待 %.0fms；失败", preprocess_ms, elapsed)
             logger.warning("ROI OCR 异常: %s", exc)
             return [], ""
         elapsed = (time.perf_counter() - started) * 1000.0
@@ -437,6 +440,8 @@ class OcrEngine(OCRProvider):
         else:
             self.monitor.record(elapsed, ok=True)
         text = " ".join(b.text for b in boxes)
+        logger.info("OCR ROI 耗时：预处理 %.0fms；推理/等待 %.0fms；输入=%s；强制新读=%s",
+                    preprocess_ms, elapsed, "预处理" if preprocess else "原图", force)
         perf_log(f"OCR roi [{cache_key or 'anon'}]", elapsed)
         if cache_key and self._cache_enabled:
             self._cache_put(cache_key, roi, boxes, text)
