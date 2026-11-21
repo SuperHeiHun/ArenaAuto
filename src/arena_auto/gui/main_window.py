@@ -12,13 +12,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Deque, List, Optional, Tuple
 
-from PySide6.QtCore import QThread, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -44,6 +45,7 @@ from arena_auto.config.manager import ConfigManager
 from arena_auto.debug.recorder import DebugRecorder
 from arena_auto.gui.widgets import ImageView, TemplateCaptureDialog
 from arena_auto.gui.ocr_text_dialog import OcrTextDialog
+from arena_auto.gui.completion_sound import CompletionSoundPlayer
 from arena_auto.gui.wireless_dialog import WirelessConnectionDialog
 from arena_auto.gui.workers import (
     AutomationWorker,
@@ -52,7 +54,7 @@ from arena_auto.gui.workers import (
     ScreenshotWorker,
 )
 from arena_auto.logging.logger import CallbackHandler
-from arena_auto.models.config import AppConfig
+from arena_auto.models.config import AppConfig, CompletionSoundSettings
 from arena_auto.models.recognition import ChallengeCount, Opponent
 from arena_auto.models.state import AutomationState, ScreenKind, SessionStatistics
 from arena_auto.paths import get_resource_path, get_template_dir
@@ -76,6 +78,23 @@ def _log_level_value(level: str) -> int:
     return _LOG_LEVEL_VALUES.get(str(level).strip().upper(), logging.INFO)
 
 
+class _AutomationStatusRelay(QObject):
+    """GUI-thread slots carry the run identity even for queued/stale signals."""
+
+    def __init__(self, window, worker):
+        super().__init__(window)
+        self.window, self.worker = window, worker
+
+    @Slot(int, int)
+    def refresh(self, count, limit):
+        self.window._on_refresh_count(count, limit, worker=self.worker)
+
+    @Slot()
+    def finish(self):
+        self.window._on_worker_finished(worker=self.worker)
+        self.deleteLater()
+
+
 class MainWindow(QMainWindow):
     """Main application window - all heavy work runs on worker threads."""
 
@@ -97,6 +116,7 @@ class MainWindow(QMainWindow):
 
         self._automation_thread: Optional[QThread] = None
         self._automation_worker: Optional[AutomationWorker] = None
+        self._status_relay: Optional[_AutomationStatusRelay] = None
         self._device_worker: Optional[DeviceListWorker] = None
         self._shot_worker: Optional[ScreenshotWorker] = None
         self._test_worker: Optional[DebugTestWorker] = None
@@ -105,6 +125,11 @@ class MainWindow(QMainWindow):
         self._preview_timer: Optional[QTimer] = None
         self._log_filter_level: int = logging.DEBUG
         self._log_entries: Deque[Tuple[str, int, str]] = deque(maxlen=5000)
+        self._displayed_refresh_count = 0
+        self._completion_pending = False
+        self._completion_settings: Optional[CompletionSoundSettings] = None
+        self._closing = False
+        self._sound_player = CompletionSoundPlayer(self)
 
         self._build_ui()
         self._attach_log_handler()
@@ -159,6 +184,21 @@ class MainWindow(QMainWindow):
         self.refresh_limit_spin.setSpecialValueText("关闭自动刷新")
         self.refresh_limit_spin.setToolTip("全部完整识别的对手均超阈值时点击刷新；达到次数立即停止，不再检查最后一批。找到合格对手后清零。0 表示只等待，不点击刷新；付费弹窗不会自动确认。")
         param_form.addRow("连续刷新上限", self.refresh_limit_spin)
+        self.completion_sound_check = QCheckBox("运行结束时播放音效")
+        self.completion_sound_check.setToolTip("自动停止、手动停止或报错结束时只播放一次；取消开始或退出窗口不播放。")
+        param_form.addRow(self.completion_sound_check)
+        sound_row = QHBoxLayout()
+        self.sound_path_edit = QLineEdit()
+        self.sound_path_edit.setPlaceholderText("留空使用系统提示音")
+        self.sound_path_edit.setClearButtonEnabled(True)
+        self.sound_browse_btn = QPushButton("选择音效")
+        self.sound_browse_btn.clicked.connect(self._choose_completion_sound)
+        self.sound_preview_btn = QPushButton("试听")
+        self.sound_preview_btn.clicked.connect(self._preview_completion_sound)
+        sound_row.addWidget(self.sound_path_edit)
+        sound_row.addWidget(self.sound_browse_btn)
+        sound_row.addWidget(self.sound_preview_btn)
+        param_form.addRow("结束音效", sound_row)
 
         self.poll_spin = QSpinBox()
         self.poll_spin.setRange(1, 120)
@@ -250,11 +290,13 @@ class MainWindow(QMainWindow):
         self.screen_label = QLabel("页面: -")
         self.target_label = QLabel("当前目标: -")
         self.challenge_label = QLabel("挑战次数: -")
+        self.refresh_count_label = QLabel("连续刷新次数：0 / 3")
         self.ocr_status_label = QLabel("OCR: -")
         status_layout.addWidget(self.state_label)
         status_layout.addWidget(self.screen_label)
         status_layout.addWidget(self.target_label)
         status_layout.addWidget(self.challenge_label)
+        status_layout.addWidget(self.refresh_count_label)
         status_layout.addWidget(self.ocr_status_label)
         left_layout.addWidget(status_box)
 
@@ -465,6 +507,9 @@ class MainWindow(QMainWindow):
         cfg = self.config
         self.threshold_edit.setText(str(cfg.automation.power_threshold))
         self.refresh_limit_spin.setValue(cfg.automation.max_consecutive_refreshes)
+        self._on_refresh_count(self._displayed_refresh_count, cfg.automation.max_consecutive_refreshes)
+        self.completion_sound_check.setChecked(cfg.completion_sound.enabled)
+        self.sound_path_edit.setText(cfg.completion_sound.path)
         self.poll_spin.setValue(int(cfg.battle.poll_interval))
         self.dry_run_check.setChecked(cfg.automation.dry_run)
         self.auto_target_check.setChecked(cfg.automation.auto_targeting)
@@ -509,6 +554,9 @@ class MainWindow(QMainWindow):
             return False
         cfg.automation.power_threshold = threshold
         cfg.automation.max_consecutive_refreshes = self.refresh_limit_spin.value()
+        self._on_refresh_count(self._displayed_refresh_count, cfg.automation.max_consecutive_refreshes)
+        cfg.completion_sound.enabled = self.completion_sound_check.isChecked()
+        cfg.completion_sound.path = self.sound_path_edit.text().strip()
         cfg.battle.poll_interval = float(self.poll_spin.value())
         cfg.automation.poll_interval = float(self.poll_spin.value())
         cfg.automation.dry_run = self.dry_run_check.isChecked()
@@ -544,6 +592,20 @@ class MainWindow(QMainWindow):
             self._append_log("INFO", f"配置已保存: {self.config_manager.path}")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "配置", f"保存失败:\n{exc}")
+
+    def _choose_completion_sound(self) -> None:
+        if self._automation_running():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择结束音效", self.sound_path_edit.text(),
+            "音频文件 (*.wav *.mp3 *.ogg *.flac);;所有文件 (*)",
+        )
+        if path:
+            self.sound_path_edit.setText(path)
+
+    def _preview_completion_sound(self) -> None:
+        # An explicit preview does not save/apply config or touch any device.
+        self._sound_player.play(CompletionSoundSettings(enabled=True, path=self.sound_path_edit.text().strip()))
 
     def open_ocr_text_settings(self) -> None:
         if self._automation_running() or any(
@@ -792,10 +854,13 @@ class MainWindow(QMainWindow):
         if not self._confirm_automation_start():
             return
 
+        self._closing = False
+        self._sound_player.stop()
         controller.reset_stop()
         self._automation_worker = AutomationWorker(controller)
         self._automation_thread = QThread(self)
         self._automation_worker.moveToThread(self._automation_thread)
+        self._status_relay = _AutomationStatusRelay(self, self._automation_worker)
         self._automation_thread.started.connect(self._automation_worker.run)
 
         self._automation_worker.state_changed.connect(self._on_state)
@@ -805,10 +870,14 @@ class MainWindow(QMainWindow):
         self._automation_worker.powers_detected.connect(self._on_powers)
         self._automation_worker.target_changed.connect(self._on_target)
         self._automation_worker.challenge_changed.connect(self._on_challenge)
+        self._automation_worker.refresh_count_changed.connect(self._status_relay.refresh)
         self._automation_worker.statistics_changed.connect(self._on_stats)
         self._automation_worker.screenshot_updated.connect(self._on_live_screenshot)
         self._automation_worker.error_occurred.connect(self._on_error)
-        self._automation_worker.finished.connect(self._on_worker_finished)
+        self._automation_worker.finished.connect(self._status_relay.finish)
+        self._completion_settings = copy.deepcopy(self.config.completion_sound)
+        self._completion_pending = True
+        self._on_refresh_count(0, self.config.automation.max_consecutive_refreshes)
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -816,6 +885,8 @@ class MainWindow(QMainWindow):
         self.auto_target_check.setEnabled(False)
         self.auto_save_check.setEnabled(False)
         self.refresh_limit_spin.setEnabled(False)
+        for control in (self.completion_sound_check, self.sound_path_edit, self.sound_browse_btn):
+            control.setEnabled(False)
         for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.ocr_lang_combo, self.gpu_fallback_check):
             control.setEnabled(False)
         # OCR loads on the automation worker thread — keep the GUI free.
@@ -868,13 +939,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("正在停止...")
         self._append_log("INFO", "请求停止")
 
-    def _on_worker_finished(self) -> None:
+    def _on_worker_finished(self, *, worker=None) -> None:
+        sender = worker if worker is not None else self.sender()
+        if isinstance(sender, AutomationWorker) and sender is not self._automation_worker:
+            return  # Ignore duplicate/stale finished events, especially after a new run starts.
+        notify = self._completion_pending
+        self._completion_pending = False
+        sound = self._completion_settings or copy.deepcopy(self.config.completion_sound)
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.save_cfg_btn.setEnabled(True)
         self.auto_target_check.setEnabled(True)
         self.auto_save_check.setEnabled(True)
         self.refresh_limit_spin.setEnabled(True)
+        for control in (self.completion_sound_check, self.sound_path_edit, self.sound_browse_btn):
+            control.setEnabled(True)
         for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.ocr_lang_combo, self.gpu_fallback_check):
             control.setEnabled(True)
         self.statusBar().showMessage("已停止")
@@ -883,6 +962,12 @@ class MainWindow(QMainWindow):
             self._automation_thread.wait(3000)
             self._automation_thread = None
         self._automation_worker = None
+        self._status_relay = None
+        if notify and sound.enabled and not self._closing:
+            try:
+                self._sound_player.play(sound)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("结束音效不可用，不影响停止流程: %s", exc)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._automation_thread is not None and self._automation_thread.isRunning():
@@ -894,8 +979,13 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 event.ignore()
                 return
+            self._closing = True
+            self._completion_pending = False
             self.stop_automation()
             self._automation_thread.wait(5000)
+        self._closing = True
+        self._completion_pending = False
+        self._sound_player.stop()
         try:
             if self._controller is not None:
                 self._controller._save_statistics()
@@ -909,6 +999,14 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- signals
     def _on_state(self, state: AutomationState) -> None:
         self.state_label.setText(state.name)
+
+    def _on_refresh_count(self, count: int, limit: int, *, worker=None) -> None:
+        sender = worker if worker is not None else self.sender()
+        if isinstance(sender, AutomationWorker) and sender is not self._automation_worker:
+            return
+        self._displayed_refresh_count = count
+        suffix = f"{count} / {limit}" if limit else f"{count}（自动刷新已关闭）"
+        self.refresh_count_label.setText(f"连续刷新次数：{suffix}")
 
     def _on_screen(self, kind: ScreenKind) -> None:
         self.screen_label.setText(f"页面: {kind.value.upper()}")

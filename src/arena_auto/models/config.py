@@ -53,6 +53,12 @@ class RecognitionSettings:
 
 
 @dataclass
+class CompletionSoundSettings:
+    enabled: bool = True
+    path: str = ""  # Empty uses the system beep; custom local audio uses Qt Multimedia.
+
+
+@dataclass
 class OcrCacheSettings:
     enabled: bool = True
     difference_threshold: float = 3.0
@@ -281,6 +287,7 @@ class AppConfig:
         }
     )
     profile: ArenaProfile = field(default_factory=ArenaProfile)
+    completion_sound: CompletionSoundSettings = field(default_factory=CompletionSoundSettings)
 
     def button_geometry(self, name: str) -> ButtonGeometry:
         """Resolve calibrated geometry for a button name (with legacy aliases)."""

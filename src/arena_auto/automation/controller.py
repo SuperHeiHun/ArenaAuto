@@ -63,6 +63,7 @@ class ControllerCallbacks:
     on_screen: Optional[Callable[[ScreenKind], None]] = None
     on_error: Optional[Callable[[str], None]] = None
     on_finished: Optional[Callable[[], None]] = None
+    on_refresh_count: Optional[Callable[[int, int], None]] = None
 
 
 @dataclass
@@ -253,6 +254,7 @@ class AutomationController:
         self.ctx = _RuntimeContext()
         self.statistics = SessionStatistics()
         self._emit_statistics()
+        self._emit_refresh_count()
         mode = "自动初始化（实时定位）" if self.config.automation.auto_targeting else "固定 ROI（已标定配置）"
         self._log("INFO", f"本轮模式：{mode}；OCR={self.config.ocr.provider}/{self.config.ocr.lang}；"
                   f"战力阈值={self.config.automation.power_threshold}；本轮参数已锁定")
@@ -371,6 +373,15 @@ class AutomationController:
 
         perf_log("Interruptible wait", (time.perf_counter() - started) * 1000.0)
         return stopped
+
+    def _emit_refresh_count(self) -> None:
+        if self.callbacks.on_refresh_count:
+            try:
+                self.callbacks.on_refresh_count(
+                    self.ctx.consecutive_refreshes, self.config.automation.max_consecutive_refreshes
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("刷新次数回调失败: %s", exc)
 
     def _safe_tap(self, x: int, y: int, label: str = "") -> None:
         if self.stop_event.is_set():
@@ -645,6 +656,7 @@ class AutomationController:
 
         assert selected.power is not None
         self.ctx.consecutive_refreshes = 0
+        self._emit_refresh_count()
         self.ctx.refresh_frame = None
         self.ctx.refresh_regions = []
         self.ctx.target = selected
@@ -757,6 +769,7 @@ class AutomationController:
             self.sm.transition(AutomationState.STOPPED)
             return
         self.ctx.consecutive_refreshes += 1
+        self._emit_refresh_count()
         self._log("INFO", f"连续刷新：{self.ctx.consecutive_refreshes}/{limit}")
         self.ctx.target = None
         self.ctx.auto_selection_attempts = 0

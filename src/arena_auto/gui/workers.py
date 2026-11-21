@@ -44,6 +44,7 @@ class AutomationWorker(QObject):
     powers_detected = Signal(list)
     target_changed = Signal(int)
     challenge_changed = Signal(object)
+    refresh_count_changed = Signal(int, int)
     statistics_changed = Signal(object)
     screenshot_updated = Signal(object)
     error_occurred = Signal(str)
@@ -70,6 +71,7 @@ class AutomationWorker(QObject):
             on_screen=lambda kind: self.screen_detected.emit(kind),
             on_error=lambda msg: self.error_occurred.emit(msg),
             on_finished=lambda: self.finished.emit(),
+            on_refresh_count=lambda count, limit: self.refresh_count_changed.emit(count, limit),
         )
         self.controller.callbacks = cb
 

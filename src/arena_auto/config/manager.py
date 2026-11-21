@@ -20,6 +20,7 @@ from arena_auto.models.config import (
     ButtonGeometry,
     CalibrationSettings,
     CalibrationWeights,
+    CompletionSoundSettings,
     DebugSettings,
     LoggingSettings,
     OpponentConfig,
@@ -306,6 +307,16 @@ class ConfigManager:
         refresh_value = data["automation"].get("max_consecutive_refreshes", 3)
         if not str(refresh_value).strip().isdigit() or not 0 <= int(refresh_value) <= 999:
             raise ConfigError("max_consecutive_refreshes 必须是 0～999 的整数")
+        sound_raw = data.get("completion_sound")
+        if not isinstance(sound_raw, dict):
+            raise ConfigError("completion_sound 必须是映射")
+        sound_enabled = sound_raw.get("enabled", True)
+        sound_path = sound_raw.get("path", "")
+        if sound_path is None:
+            sound_path = ""
+        if type(sound_enabled) is not bool or not isinstance(sound_path, str):
+            raise ConfigError("completion_sound.enabled 必须是布尔值，path 必须是文件路径文本")
+        completion_sound = CompletionSoundSettings(enabled=sound_enabled, path=sound_path)
 
         adb = AdbConfig(
             executable=str(data["adb"].get("executable", "adb")),
@@ -577,6 +588,7 @@ class ConfigManager:
             version=version,
             adb=adb,
             automation=automation,
+            completion_sound=completion_sound,
             recognition=recognition,
             ocr=ocr,
             logging=logging_settings,
@@ -615,6 +627,9 @@ class ConfigManager:
         refresh_limit = config.automation.max_consecutive_refreshes
         if type(refresh_limit) is not int or not 0 <= refresh_limit <= 999:
             raise ConfigError("max_consecutive_refreshes 必须是 0～999 的整数")
+        if (type(config.completion_sound.enabled) is not bool
+                or not isinstance(config.completion_sound.path, str)):
+            raise ConfigError("completion_sound.enabled 必须是布尔值，path 必须是文件路径文本")
         if config.battle.poll_interval <= 0:
             raise ConfigError("battle.poll_interval 必须大于 0")
         if config.battle.result_ocr_interval <= 0:
