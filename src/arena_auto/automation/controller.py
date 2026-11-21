@@ -798,6 +798,7 @@ class AutomationController:
         old_frame = self.ctx.prepare_frame
         self.ctx.prepare_frame = None
         observed_button = None
+        prepare_structure = None
         age = time.monotonic() - self.ctx.prepare_frame_at
         if old_frame is None:
             reason = "无备战前帧"
@@ -806,19 +807,45 @@ class AutomationController:
         else:
             # Read evidence before _shot invalidates the same-frame OCR cache.
             observed_button, reason = self.buttons.cached_go_win_evidence(old_frame)
+            if observed_button is not None:
+                from arena_auto.recognition.prepare_guard import PrepareStructure
+
+                started = time.perf_counter()
+                prepare_structure = PrepareStructure.discover(
+                    old_frame, self.frame_cache.peek(old_frame), observed_button.bbox
+                )
+                self._log("INFO", f"备战稳定结构定位耗时 {(time.perf_counter() - started) * 1000.0:.0f}ms；"
+                          f"定位成功={prepare_structure is not None}")
         image = self._shot()
         from arena_auto.recognition.frame_guard import compare_regions, save_guard_evidence
 
+        if self.stop_event.is_set():
+            raise StoppedError("用户停止")
+        if observed_button is not None and time.monotonic() - self.ctx.prepare_frame_at > 5.0:
+            observed_button = None
+            reason = "备战证据在新截图获取后过期"
         report = None
+        block_click = False
         if observed_button is not None and observed_button.found:
             started = time.perf_counter()
-            report = compare_regions(old_frame, image,
-                                     [(0, 0, image.shape[1], image.shape[0]), observed_button.bbox])
+            if prepare_structure is not None:
+                report, block_click = prepare_structure.validate(old_frame, image)
+                self._log("INFO", f"备战结构复用校验：面板={prepare_structure.panel}；对手摘要={prepare_structure.summary}")
+            else:
+                report = compare_regions(old_frame, image,
+                                         [(0, 0, image.shape[1], image.shape[0]), observed_button.bbox])
+                self._log("INFO", "备战稳定结构未定位：保留整页严格校验")
             self._log("INFO", f"备战画面校验耗时 {(time.perf_counter() - started) * 1000.0:.0f}ms")
             reason = report.describe()
         if report is not None and report.unchanged:
             result = observed_button
-            self._log("INFO", "备战按钮复用：新截图验证页面未变化，跳过重复 OCR")
+            self._log("INFO", "备战按钮复用：新截图验证稳定结构，跳过重复 OCR" if prepare_structure is not None
+                      else "备战按钮复用：新截图验证页面未变化，跳过重复 OCR")
+        elif block_click:
+            self._log("WARNING", f"备战点击阻止：{reason}；停止自动化，需处理遮挡后重新开始")
+            save_guard_evidence(self.debug, old_frame, image, report, "prepare_blocked")
+            self.sm.transition(AutomationState.STOPPED)
+            return
         else:
             self._log("INFO", f"备战按钮复用未命中：{reason}；回退新图检测")
             if report is not None:
