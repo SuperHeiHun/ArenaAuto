@@ -1,4 +1,6 @@
-# ArenaAuto  
+# ArenaAuto
+
+版本更新内容见 [更新日志](CHANGELOG.md)。
 
 > **项目全部由mimov2.6flash编写 bug较多介意误用**  
 

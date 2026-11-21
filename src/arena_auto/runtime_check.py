@@ -13,6 +13,7 @@ def main(argv=None) -> int:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--language", choices=("ch", "japan", "korean"), default="ch")
+    parser.add_argument("--check-desktop", action="store_true", help="verify packaged audio APIs and refresh icon without playing sound")
     args = parser.parse_args(argv)
     report = {"ok": False, "device_actions": 0, "frozen": bool(getattr(sys, "frozen", False))}
     try:
@@ -34,8 +35,21 @@ def main(argv=None) -> int:
             raise RuntimeError("打包模型推理没有返回文字")
         if not all(path.is_file() for path in provider._model_paths):
             raise RuntimeError("打包 OCR 模型文件缺失")
+        if args.check_desktop:
+            report.update(desktop_checked=True, audio_api_available=False, refresh_template_available=False)
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+            from arena_auto.paths import get_resource_path
+
+            if not callable(QAudioOutput) or not hasattr(QMediaPlayer, "errorOccurred"):
+                raise RuntimeError("打包音频 API 不完整")
+            report["audio_api_available"] = True
+            icon_path = get_resource_path("resources/templates/refresh_opponents.png")
+            if not icon_path.is_file() or cv2.imdecode(np.fromfile(icon_path, dtype=np.uint8), cv2.IMREAD_COLOR) is None:
+                raise RuntimeError("打包刷新图标缺失或无法解码")
+            report["refresh_template_available"] = True
+        from arena_auto import __version__
         defaults = ConfigManager.initial_config()
-        report.update(ok=True, language=args.language, provider=provider.name, device=provider.device_label,
+        report.update(ok=True, version=__version__, language=args.language, provider=provider.name, device=provider.device_label,
                       session_providers=provider.session_providers, texts=[b.text for b in boxes],
                       model_count=len(provider._model_paths),
                       default_auto_initialize=defaults.automation.auto_targeting,

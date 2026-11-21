@@ -66,7 +66,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $exe = (Resolve-Path "dist/ArenaAuto/ArenaAuto.exe").Path
           $report = Join-Path $env:RUNNER_TEMP "arenaauto-packaged-runtime.json"
-          $process = Start-Process -FilePath $exe -ArgumentList @("--self-test", "--report", "`"$report`"") -PassThru
+          $process = Start-Process -FilePath $exe -ArgumentList @("--self-test", "--check-desktop", "--report", "`"$report`"") -PassThru
           if (-not $process.WaitForExit(180000)) {
             $process.Kill()
             throw "Packaged OCR smoke test timed out"
@@ -78,6 +78,9 @@ jobs:
           $result = Get-Content $report -Raw | ConvertFrom-Json
           if (-not $result.ok -or -not $result.frozen -or $result.model_count -ne 2 -or -not $result.default_auto_initialize -or $result.default_ocr_provider -ne "rapidocr") {
             throw "Packaged models or runtime are invalid"
+          }
+          if (-not $result.desktop_checked -or -not $result.audio_api_available -or -not $result.refresh_template_available -or $result.device_actions -ne 0) {
+            throw "Packaged audio APIs or refresh icon are invalid"
           }
           Get-Content $report
           $koreanReport = Join-Path $env:RUNNER_TEMP "arenaauto-packaged-korean-runtime.json"
@@ -100,7 +103,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Copy-Item README.md, LICENSE -Destination "dist/ArenaAuto/"
+          Copy-Item README.md, CHANGELOG.md, LICENSE -Destination "dist/ArenaAuto/"
           $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev" }
           $zip = "ArenaAuto-$tag-windows-x64.zip"
           Compress-Archive -Path "dist/ArenaAuto" -DestinationPath $zip -Force
