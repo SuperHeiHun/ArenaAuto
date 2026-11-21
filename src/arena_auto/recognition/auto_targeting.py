@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import statistics
 import time
+from arena_auto.logging.categories import FLOW_TIMING
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
 
@@ -417,7 +418,8 @@ class AutoTargeting:
                     report = compare_regions(hint, confirmation_frame, [region]) if cards and ordered else None
                     unchanged = report is not None and report.unchanged
                     logger.info("布局验证耗时：新截图 %.0fms；画面校验 %.0fms；复用=%s",
-                                capture_ms, (time.perf_counter() - started) * 1000.0, bool(unchanged))
+                                capture_ms, (time.perf_counter() - started) * 1000.0, bool(unchanged),
+                                extra={"log_category": FLOW_TIMING})
                     if unchanged:
                         logger.info("布局复用：新截图已验证整个列表区域，跳过重复整图 OCR")
                         self.last_image = confirmation_frame
@@ -489,7 +491,8 @@ class AutoTargeting:
             logger.info("自动选点 #%s 数字 ROI 第 %s 次: %s", card.opponent.id, read + 1, value if value is not None else "OCR_FAILED")
             logger.info("战力复核耗时 #%s 第%s次：截图 %.0fms；ROI读取 %.0fms%s",
                         card.opponent.id, read + 1, capture_ms, read_ms,
-                        "（首帧已在布局验证时获取）" if prefetched else "")
+                        "（首帧已在布局验证时获取）" if prefetched else "",
+                        extra={"log_category": FLOW_TIMING})
             streak = streak + 1 if value is not None and value == previous else 1 if value is not None else 0
             previous = value
             if streak >= needed:

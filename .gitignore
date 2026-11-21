@@ -23,6 +23,7 @@ prompt2.md
 # Device-specific configuration and auto-generated templates stay local.
 /config/config.yaml
 /config/config.calibrated.yaml
+.arena-config-*.tmp
 /resources/templates/generated/
 /resources/models/
 

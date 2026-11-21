@@ -29,6 +29,7 @@ from arena_auto.models.recognition import (
     Region,
 )
 from arena_auto.models.state import ScreenKind
+from arena_auto.logging.categories import OCR_TIMING
 from arena_auto.recognition.ocr import (
     OCRProvider,
     find_text_boxes,
@@ -111,7 +112,7 @@ class ScreenDetector:
             logger.warning("页面 OCR 失败: %s", exc)
             boxes = []
         elapsed = (time.perf_counter() - started) * 1000.0
-        perf_log("Page OCR", elapsed)
+        perf_log("Page OCR", elapsed, category=OCR_TIMING)
         self._frame_boxes_ref = screenshot
         self._frame_boxes = list(boxes)
         return self._frame_boxes
@@ -905,7 +906,7 @@ class ChallengeCountReader:
             if parsed is not None:
                 count = ChallengeCount(current=parsed[0], maximum=parsed[1])
                 elapsed = (time.perf_counter() - started) * 1000.0
-                perf_log("Challenge OCR (roi)", elapsed)
+                perf_log("Challenge OCR (roi)", elapsed, category=OCR_TIMING)
                 logger.info("挑战次数：%s", count)
                 return count
 
@@ -923,12 +924,12 @@ class ChallengeCountReader:
             if parsed is not None:
                 count = ChallengeCount(current=parsed[0], maximum=parsed[1])
                 elapsed = (time.perf_counter() - started) * 1000.0
-                perf_log("Challenge OCR (full fallback)", elapsed)
+                perf_log("Challenge OCR (full fallback)", elapsed, category=OCR_TIMING)
                 logger.info("挑战次数(全图)：%s", count)
                 return count
 
         elapsed = (time.perf_counter() - started) * 1000.0
-        perf_log("Challenge OCR (failed)", elapsed)
+        perf_log("Challenge OCR (failed)", elapsed, category=OCR_TIMING)
         logger.warning("挑战次数 OCR_FAILED roi_raw=%r", self.last_raw)
         if self.debug is not None:
             try:

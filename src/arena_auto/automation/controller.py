@@ -45,6 +45,7 @@ from arena_auto.recognition.scene_change import SettledSceneChange
 from arena_auto.recognition.ocr_engine import OcrEngine
 from arena_auto.recognition.screen import CoordinateScaler, crop_region
 from arena_auto.recognition.template import TemplateRecognizer
+from arena_auto.logging.categories import ADB_TIMING, FLOW_TIMING, GENERAL
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ class ControllerCallbacks:
     on_error: Optional[Callable[[str], None]] = None
     on_finished: Optional[Callable[[], None]] = None
     on_refresh_count: Optional[Callable[[int, int], None]] = None
+    on_categorized_log: Optional[Callable[[str, str, str], None]] = None
 
 
 @dataclass
@@ -334,11 +336,16 @@ class AutomationController:
         if new != old:
             self._log("INFO", f"状态: {old.name} -> {new.name}")
 
-    def _log(self, level: str, message: str) -> None:
-        logger.log(getattr(logging, level.upper(), logging.INFO), message)
+    def _log(self, level: str, message: str, *, category: str = GENERAL) -> None:
+        logger.log(getattr(logging, level.upper(), logging.INFO), message, extra={"log_category": category})
         if self.callbacks.on_log:
             try:
                 self.callbacks.on_log(level, message)
+            except Exception:  # noqa: BLE001
+                pass
+        if self.callbacks.on_categorized_log:
+            try:
+                self.callbacks.on_categorized_log(level, message, category)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -410,7 +417,7 @@ class AutomationController:
         try:
             from arena_auto.recognition.ocr_engine import perf_log
 
-            perf_log("ADB screenshot", elapsed)
+            perf_log("ADB screenshot", elapsed, category=ADB_TIMING)
         except Exception:  # noqa: BLE001
             pass
         processing_started = time.perf_counter()
@@ -420,7 +427,7 @@ class AutomationController:
         self._emit_screenshot(image)
         logger.info("截图流程耗时：获取 %.0fms；缩放/状态/界面回调 %.0fms；总计 %.0fms",
                     elapsed, (time.perf_counter() - processing_started) * 1000.0,
-                    (time.perf_counter() - started) * 1000.0)
+                    (time.perf_counter() - started) * 1000.0, extra={"log_category": ADB_TIMING})
         return image
 
     def _step(self) -> None:
@@ -973,7 +980,7 @@ class AutomationController:
                     old_frame, self.frame_cache.peek(old_frame), observed_button.bbox
                 )
                 self._log("INFO", f"备战稳定结构定位耗时 {(time.perf_counter() - started) * 1000.0:.0f}ms；"
-                          f"定位成功={prepare_structure is not None}")
+                          f"定位成功={prepare_structure is not None}", category=FLOW_TIMING)
         image = self._shot()
         from arena_auto.recognition.frame_guard import compare_regions, save_guard_evidence
 
@@ -993,7 +1000,7 @@ class AutomationController:
                 report = compare_regions(old_frame, image,
                                          [(0, 0, image.shape[1], image.shape[0]), observed_button.bbox])
                 self._log("INFO", "备战稳定结构未定位：保留整页严格校验")
-            self._log("INFO", f"备战画面校验耗时 {(time.perf_counter() - started) * 1000.0:.0f}ms")
+            self._log("INFO", f"备战画面校验耗时 {(time.perf_counter() - started) * 1000.0:.0f}ms", category=FLOW_TIMING)
             reason = report.describe()
         if report is not None and report.unchanged:
             result = observed_button

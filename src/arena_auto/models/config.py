@@ -93,6 +93,8 @@ class OcrSettings:
 @dataclass
 class LoggingSettings:
     performance: bool = False
+    gui_level: str = "DEBUG"
+    gui_category: str = "all"
 
 
 @dataclass

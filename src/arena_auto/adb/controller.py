@@ -20,6 +20,7 @@ from arena_auto.exceptions import (
 )
 from arena_auto.models.config import AdbConfig
 from arena_auto.process_utils import no_console_window_options
+from arena_auto.logging.categories import ADB_TIMING
 
 logger = logging.getLogger(__name__)
 
@@ -415,7 +416,8 @@ class AdbController:
             self._screenshot_serial = self._serial
             logger.info("ADB截图耗时：锁等待 %.0fms；命令/设备编码/传输 %.0fms；PNG修复/解码 %.0fms；数据 %s bytes",
                         (started - requested) * 1000.0, transport_ms,
-                        (time.perf_counter() - decode_started) * 1000.0, byte_count)
+                        (time.perf_counter() - decode_started) * 1000.0, byte_count,
+                        extra={"log_category": ADB_TIMING})
             return image
 
     def tap(self, x: int, y: int, delay: float = 0.0) -> None:
@@ -445,7 +447,8 @@ class AdbController:
                 time.sleep(delay)
             logger.info("ADB点击耗时：连接检查 %.0fms（%s）；点击命令 %.0fms；点击等待 %.0fms",
                         probe_ms, f"复用近期截图 {age:.2f}s" if reuse else "主动探测",
-                        command_ms, (time.perf_counter() - wait_started) * 1000.0)
+                        command_ms, (time.perf_counter() - wait_started) * 1000.0,
+                        extra={"log_category": ADB_TIMING})
 
     def swipe(
         self,

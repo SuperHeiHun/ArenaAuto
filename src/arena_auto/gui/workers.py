@@ -41,6 +41,7 @@ class AutomationWorker(QObject):
     state_changed = Signal(AutomationState)
     screen_detected = Signal(ScreenKind)
     log_message = Signal(str, str)
+    categorized_log_message = Signal(str, str, str)
     powers_detected = Signal(list)
     target_changed = Signal(int)
     challenge_changed = Signal(object)
@@ -72,6 +73,7 @@ class AutomationWorker(QObject):
             on_error=lambda msg: self.error_occurred.emit(msg),
             on_finished=lambda: self.finished.emit(),
             on_refresh_count=lambda count, limit: self.refresh_count_changed.emit(count, limit),
+            on_categorized_log=lambda level, msg, category: self.categorized_log_message.emit(level, msg, category),
         )
         self.controller.callbacks = cb
 

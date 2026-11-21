@@ -54,6 +54,7 @@ from arena_auto.gui.workers import (
     ScreenshotWorker,
 )
 from arena_auto.logging.logger import CallbackHandler
+from arena_auto.logging.categories import CATEGORY_LABELS, GENERAL, normalize_category
 from arena_auto.models.config import AppConfig, CompletionSoundSettings
 from arena_auto.models.recognition import ChallengeCount, Opponent
 from arena_auto.models.state import AutomationState, ScreenKind, SessionStatistics
@@ -99,6 +100,7 @@ class MainWindow(QMainWindow):
     """Main application window - all heavy work runs on worker threads."""
 
     log_received = Signal(str, str)
+    categorized_log_received = Signal(str, str, str)
 
     def __init__(self, config_manager: ConfigManager, parent=None) -> None:
         super().__init__(parent)
@@ -124,12 +126,15 @@ class MainWindow(QMainWindow):
         self._controller: Optional[AutomationController] = None
         self._preview_timer: Optional[QTimer] = None
         self._log_filter_level: int = logging.DEBUG
-        self._log_entries: Deque[Tuple[str, int, str]] = deque(maxlen=5000)
+        self._log_filter_type = "all"
+        self._log_entries: Deque[Tuple[str, int, str, str]] = deque(maxlen=5000)
         self._displayed_refresh_count = 0
         self._completion_pending = False
         self._completion_settings: Optional[CompletionSoundSettings] = None
         self._closing = False
         self._sound_player = CompletionSoundPlayer(self)
+        self._close_baseline = copy.deepcopy(self.config)
+        self._form_snapshot = {}
 
         self._build_ui()
         self._attach_log_handler()
@@ -428,6 +433,14 @@ class MainWindow(QMainWindow):
             self.log_level_combo.addItem(label, level)
         self.log_level_combo.currentIndexChanged.connect(self._on_log_filter_changed)
         log_actions.addWidget(self.log_level_combo)
+        log_actions.addWidget(QLabel("日志类型:"))
+        self.log_type_combo = QComboBox()
+        self.log_type_combo.setToolTip("类型与等级独立筛选；ADB耗时不混入常规日志，日志文件仍保留全部类型")
+        self.log_type_combo.addItem("全部类型", "all")
+        for category, label in CATEGORY_LABELS.items():
+            self.log_type_combo.addItem(label, category)
+        self.log_type_combo.currentIndexChanged.connect(self._on_log_type_changed)
+        log_actions.addWidget(self.log_type_combo)
         log_layout.addLayout(log_actions)
         right.addTab(log_tab, "日志")
 
@@ -443,23 +456,32 @@ class MainWindow(QMainWindow):
     def _attach_log_handler(self) -> None:
         root = logging.getLogger("arena_auto")
         self.log_received.connect(self._append_log, Qt.QueuedConnection)
+        self.categorized_log_received.connect(self._append_log, Qt.QueuedConnection)
 
         def _emit(level: str, message: str) -> None:
             # A timer created on a busy OCR worker only fires after it stops.
             # A queued QObject signal delivers directly to the GUI event loop.
             self.log_received.emit(level, message)
 
-        handler = CallbackHandler(_emit, level=logging.DEBUG)
+        def _emit_categorized(level: str, message: str, category: str) -> None:
+            self.categorized_log_received.emit(level, message, category)
+
+        handler = CallbackHandler(_emit, level=logging.DEBUG, categorized_callback=_emit_categorized)
         handler.setLevel(logging.DEBUG)
         root.addHandler(handler)
         self._log_handler = handler
 
-    def _append_log(self, level: str, message: str) -> None:
+    def _append_log(self, level: str, message: str, category: str = GENERAL) -> None:
         # HH:MM:SS prefix on every GUI log line (CallbackHandler no longer adds asctime)
         level_no = _log_level_value(level)
+        category = normalize_category(category)
+        if category != GENERAL:
+            prefix = f"[{level}] [{CATEGORY_LABELS[category]}] "
+            if not message.startswith(prefix):
+                message = prefix + message
         ts = datetime.now().strftime("%H:%M:%S")
-        self._log_entries.append((ts, level_no, message))
-        if level_no >= self._log_filter_level:
+        self._log_entries.append((ts, level_no, message, category))
+        if self._log_visible(level_no, category):
             self._write_log_lines([(ts, message)])
         if "OCR Ready" in message or "OCR 初始化中" in message:
             self.ocr_status_label.setText(
@@ -479,8 +501,8 @@ class MainWindow(QMainWindow):
         """Redraw the log page after a filter change, preserving history."""
         visible = (
             f"[{ts}] {message}"
-            for ts, level_no, message in self._log_entries
-            if level_no >= self._log_filter_level
+            for ts, level_no, message, category in self._log_entries
+            if self._log_visible(level_no, category)
         )
         self.log_view.setUpdatesEnabled(False)
         try:
@@ -496,6 +518,17 @@ class MainWindow(QMainWindow):
         if value is None:
             return
         self._log_filter_level = int(value)
+        self._render_log_entries()
+
+    def _log_visible(self, level_no: int, category: str) -> bool:
+        return (level_no >= self._log_filter_level
+                and (self._log_filter_type == "all" or category == self._log_filter_type))
+
+    def _on_log_type_changed(self, index: int) -> None:
+        category = self.log_type_combo.itemData(index)
+        if category is None:
+            return
+        self._log_filter_type = category
         self._render_log_entries()
 
     def _clear_log(self) -> None:
@@ -530,8 +563,38 @@ class MainWindow(QMainWindow):
             lang_index = self.ocr_lang_combo.findData(cfg.ocr.lang)
         self.ocr_lang_combo.setCurrentIndex(lang_index)
         self.gpu_fallback_check.setChecked(cfg.ocr.gpu_fallback_to_cpu)
+        self.log_level_combo.setCurrentIndex(self.log_level_combo.findData(_log_level_value(cfg.logging.gui_level)))
+        self.log_type_combo.setCurrentIndex(self.log_type_combo.findData(cfg.logging.gui_category))
+        self._close_baseline = copy.deepcopy(cfg)
+        self._form_snapshot = self._form_state()
 
-    def _apply_form_to_config(self) -> bool:
+    def _form_state(self):
+        """Raw widget state detects actual edits, not rounding/default normalization."""
+        return {
+            ("automation", "power_threshold"): self.threshold_edit.text(),
+            ("automation", "max_consecutive_refreshes"): self.refresh_limit_spin.value(),
+            ("automation", "poll_interval"): self.poll_spin.value(),
+            ("battle", "poll_interval"): self.poll_spin.value(),
+            ("automation", "dry_run"): self.dry_run_check.isChecked(),
+            ("automation", "auto_targeting"): self.auto_target_check.isChecked(),
+            ("automation", "auto_targeting_save_config"): self.auto_save_check.isChecked(),
+            ("purchase", "enabled"): self.purchase_check.isChecked(),
+            ("purchase", "auto_confirm"): self.auto_confirm_check.isChecked(),
+            ("debug", "enabled"): self.debug_check.isChecked(),
+            ("ocr", "provider"): self.provider_combo.currentText(),
+            ("ocr", "device"): self.ocr_device_combo.currentText(),
+            ("ocr", "gpu_device_id"): self.gpu_device_spin.value(),
+            ("ocr", "lang"): self.ocr_lang_combo.currentData(),
+            ("ocr", "gpu_fallback_to_cpu"): self.gpu_fallback_check.isChecked(),
+            ("ocr", "scale"): self.ocr_scale_spin.value(),
+            ("completion_sound", "enabled"): self.completion_sound_check.isChecked(),
+            ("completion_sound", "path"): self.sound_path_edit.text(),
+            ("adb", "serial"): self.device_combo.currentText().strip(),
+            ("logging", "gui_level"): self.log_level_combo.currentData(),
+            ("logging", "gui_category"): self.log_type_combo.currentData(),
+        }
+
+    def _apply_form_to_config(self, *, preserve_unselected_device=False) -> bool:
         if self._automation_running():
             self.statusBar().showMessage("运行中参数已锁定，请先停止再修改", 4000)
             return False
@@ -571,11 +634,14 @@ class MainWindow(QMainWindow):
         cfg.ocr.lang = str(self.ocr_lang_combo.currentData())
         cfg.ocr.gpu_device_id = self.gpu_device_spin.value()
         cfg.ocr.gpu_fallback_to_cpu = self.gpu_fallback_check.isChecked()
+        cfg.logging.gui_level = logging.getLevelName(self.log_level_combo.currentData())
+        cfg.logging.gui_category = self.log_type_combo.currentData()
 
         serial = self.device_combo.currentText().strip()
         if serial == "未检测到 Android 设备":
             serial = ""
-        cfg.adb.serial = serial
+        if serial or not preserve_unselected_device:
+            cfg.adb.serial = serial
         self.config_manager.config = cfg
         self.adb.update_config(cfg.adb)
         return True
@@ -585,6 +651,8 @@ class MainWindow(QMainWindow):
             return
         try:
             self.config_manager.save(self.config)
+            self._close_baseline = copy.deepcopy(self.config)
+            self._form_snapshot = self._form_state()
             self.debug_recorder = DebugRecorder(self.config.debug)
             if self._controller is not None:
                 self._controller.reload_config()
@@ -592,6 +660,25 @@ class MainWindow(QMainWindow):
             self._append_log("INFO", f"配置已保存: {self.config_manager.path}")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "配置", f"保存失败:\n{exc}")
+
+    def _save_settings_on_close(self) -> bool:
+        changed = [path for path, value in self._form_state().items()
+                   if self._form_snapshot.get(path) != value]
+        if not self._apply_form_to_config(preserve_unselected_device=True):
+            return False
+        try:
+            baseline = self.config_manager.disk_snapshot or self._close_baseline
+            self.config = self.config_manager.save_ui_settings(self.config, baseline, changed)
+            logger.info("退出设置已保存: %s", self.config_manager.path)
+            if not hasattr(self, "_log_handler"):
+                self._append_log("INFO", f"退出设置已保存: {self.config_manager.path}")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("退出设置保存失败: %s", exc)
+            if not hasattr(self, "_log_handler"):
+                self._append_log("ERROR", f"退出设置保存失败: {exc}")
+            QMessageBox.critical(self, "退出保存失败", f"设置未保存，已取消退出。\n{exc}")
+            return False
 
     def _choose_completion_sound(self) -> None:
         if self._automation_running():
@@ -866,7 +953,7 @@ class MainWindow(QMainWindow):
         self._automation_worker.state_changed.connect(self._on_state)
         self._automation_worker.screen_detected.connect(self._on_screen)
         if not hasattr(self, "_log_handler"):
-            self._automation_worker.log_message.connect(self._append_log)
+            self._automation_worker.categorized_log_message.connect(self._append_log)
         self._automation_worker.powers_detected.connect(self._on_powers)
         self._automation_worker.target_changed.connect(self._on_target)
         self._automation_worker.challenge_changed.connect(self._on_challenge)
@@ -970,6 +1057,7 @@ class MainWindow(QMainWindow):
                 logger.warning("结束音效不可用，不影响停止流程: %s", exc)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        was_pending = self._completion_pending
         if self._automation_thread is not None and self._automation_thread.isRunning():
             answer = QMessageBox.question(
                 self,
@@ -982,9 +1070,25 @@ class MainWindow(QMainWindow):
             self._closing = True
             self._completion_pending = False
             self.stop_automation()
-            self._automation_thread.wait(5000)
+            if not self._automation_thread.wait(5000):
+                self._closing = False
+                self._completion_pending = was_pending
+                QMessageBox.warning(self, "仍在停止", "运行线程尚未结束，暂不保存或退出，请稍后重试。")
+                event.ignore()
+                return
+        for worker in (self._device_worker, self._shot_worker, self._test_worker, self._calibration_worker):
+            if worker is not None and worker.isRunning() and not worker.wait(5000):
+                self._closing = False
+                self._completion_pending = was_pending
+                QMessageBox.warning(self, "后台任务未结束", "请等待设备或识别任务完成后再退出。")
+                event.ignore()
+                return
         self._closing = True
         self._completion_pending = False
+        if not self._save_settings_on_close():
+            self._closing = False
+            event.ignore()
+            return
         self._sound_player.stop()
         try:
             if self._controller is not None:

@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from arena_auto.paths import get_log_dir
+from arena_auto.logging.categories import CategoryFormatter, GENERAL, normalize_category
 
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(category_prefix)s%(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 _configured = False
@@ -22,15 +23,21 @@ class CallbackHandler(logging.Handler):
     Formats as ``[LEVEL] message`` only — the GUI prepends ``HH:MM:SS``.
     """
 
-    def __init__(self, callback: Callable[[str, str], None], level: int = logging.INFO):
+    def __init__(self, callback: Callable[[str, str], None], level: int = logging.INFO,
+                 categorized_callback: Optional[Callable[[str, str, str], None]] = None):
         super().__init__(level=level)
         self._callback = callback
-        self.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        self._categorized_callback = categorized_callback
+        self.setFormatter(CategoryFormatter("[%(levelname)s] %(category_prefix)s%(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             message = self.format(record)
-            self._callback(record.levelname, message)
+            if self._categorized_callback is not None:
+                self._categorized_callback(record.levelname, message,
+                                           normalize_category(getattr(record, "log_category", GENERAL)))
+            else:
+                self._callback(record.levelname, message)
         except Exception:  # noqa: BLE001 - never let logging break the app
             self.handleError(record)
 
@@ -70,7 +77,7 @@ def setup_logging(
             ph = RotatingFileHandler(
                 perf_file, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
             )
-            ph.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
+            ph.setFormatter(CategoryFormatter(LOG_FORMAT, datefmt=DATE_FORMAT))
             perf_logger.addHandler(ph)
         perf_logger.propagate = False
 
@@ -79,7 +86,7 @@ def setup_logging(
 
     log_file = log_dir / "arena_auto.log"
 
-    formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
+    formatter = CategoryFormatter(LOG_FORMAT, datefmt=DATE_FORMAT)
 
     file_handler = RotatingFileHandler(
         log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"

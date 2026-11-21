@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,8 +41,22 @@ from arena_auto.models.config import (
     normalize_ocr_language,
 )
 from arena_auto.paths import get_config_path
+from arena_auto.logging.categories import CATEGORY_LABELS
 
 logger = logging.getLogger(__name__)
+
+# Only settings directly represented by the main form may be merged on exit.
+UI_SETTING_PATHS = (
+    ("automation", "power_threshold"), ("automation", "max_consecutive_refreshes"),
+    ("automation", "poll_interval"), ("battle", "poll_interval"),
+    ("automation", "dry_run"), ("automation", "auto_targeting"),
+    ("automation", "auto_targeting_save_config"), ("purchase", "enabled"),
+    ("purchase", "auto_confirm"), ("debug", "enabled"),
+    ("ocr", "provider"), ("ocr", "device"), ("ocr", "gpu_device_id"),
+    ("ocr", "lang"), ("ocr", "gpu_fallback_to_cpu"), ("ocr", "scale"),
+    ("completion_sound", "enabled"), ("completion_sound", "path"), ("adb", "serial"),
+    ("logging", "gui_level"), ("logging", "gui_category"),
+)
 
 
 def _as_region(value: Any, field_name: str) -> Tuple[int, int, int, int]:
@@ -180,6 +196,11 @@ class ConfigManager:
         self.path = Path(path) if path else get_config_path()
         self.config: AppConfig = config or AppConfig()
         self.last_error: str = ""
+        self._disk_snapshot: Optional[AppConfig] = None
+
+    @property
+    def disk_snapshot(self) -> Optional[AppConfig]:
+        return copy.deepcopy(self._disk_snapshot)
 
     # ------------------------------------------------------------------ factory
     @staticmethod
@@ -221,6 +242,7 @@ class ConfigManager:
             raise ConfigError("config.yaml 根节点必须是映射(dict)")
         raw = ConfigMigrator.migrate(raw)
         self.config = self.from_dict(raw)
+        self._disk_snapshot = copy.deepcopy(self.config)
         return self.config
 
     def save(self, config: Optional[AppConfig] = None) -> None:
@@ -229,12 +251,82 @@ class ConfigManager:
         data = asdict(self.config)
         data["version"] = max(int(self.config.version), ConfigMigrator.CURRENT_VERSION)
         data["challenge_count"] = {"region": list(data.get("challenge_region", []))}
+        self._write_data(data)
+        self._disk_snapshot = copy.deepcopy(self.config)
+
+    def _write_data(self, data, *, expected=None, check_current=False) -> None:
+        """Replace a complete UTF-8 YAML atomically; failed writes keep the old file."""
+        temporary = None
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            target = self.path.resolve() if self.path.is_symlink() else self.path
+            target.parent.mkdir(parents=True, exist_ok=True)
             text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
-            self.path.write_text(text, encoding="utf-8")
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                             dir=target.parent, prefix=".arena-config-", suffix=".tmp",
+                                             delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if check_current:
+                current = self.path.read_bytes() if self.path.exists() else None
+                if current != expected:
+                    raise ConfigError("配置在保存期间发生变化，请重新载入后再保存")
+            os.replace(temporary, target)
         except OSError as exc:
             raise ConfigError(f"无法写入配置: {exc}") from exc
+        finally:
+            if temporary is not None and temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError as exc:
+                    logger.warning("无法清理配置临时文件 %s: %s", temporary, exc)
+
+    def save_ui_settings(self, config: AppConfig, baseline: AppConfig, changed_paths) -> AppConfig:
+        """Merge edited form fields into the latest file, preserving unrelated user work."""
+        if any(path not in UI_SETTING_PATHS for path in changed_paths):
+            raise ConfigError("退出保存只能更新界面设置字段")
+        try:
+            expected = self.path.read_bytes() if self.path.exists() else None
+            raw = yaml.safe_load(expected.decode("utf-8")) if expected is not None else None
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise ConfigError(f"无法读取最新配置，未覆盖文件: {exc}") from exc
+        if expected is None:
+            result = self.from_dict(asdict(config))
+            data = asdict(result)
+            data["version"] = max(result.version, ConfigMigrator.CURRENT_VERSION)
+            data["challenge_count"] = {"region": list(result.challenge_region)}
+            self._write_data(data, expected=None, check_current=True)
+            self.config = result
+            self._disk_snapshot = copy.deepcopy(result)
+            return result
+        if raw is None:
+            raw = {}  # Match load(): an existing empty YAML file means defaults.
+        if not isinstance(raw, dict):
+            raise ConfigError("最新config.yaml不是映射，未覆盖文件")
+        latest = self.from_dict(ConfigMigrator.migrate(raw))
+        original, desired, on_disk = asdict(baseline), asdict(config), asdict(latest)
+        edited = False
+        for section, field in changed_paths:
+            old, new, current = original[section][field], desired[section][field], on_disk[section][field]
+            if new == old:
+                continue
+            if current != old and current != new:
+                raise ConfigError(f"{section}.{field}同时在文件和界面中修改，请重新载入后再保存")
+            if current != new:
+                raw.setdefault(section, {})[field] = copy.deepcopy(new)
+                edited = True
+        result = self.from_dict(ConfigMigrator.migrate(raw))
+        if edited:
+            try:
+                version = int(raw.get("version", 1) or 1)
+            except (TypeError, ValueError):
+                version = 1
+            raw["version"] = max(version, ConfigMigrator.CURRENT_VERSION)
+            self._write_data(raw, expected=expected, check_current=True)
+        self.config = result
+        self._disk_snapshot = copy.deepcopy(result)
+        return result
 
     def save_opponent_geometry(
         self, updates: Dict[int, OpponentConfig]
@@ -389,8 +481,15 @@ class ConfigManager:
         log_raw = data.get("logging") or {}
         if not isinstance(log_raw, dict):
             raise ConfigError("logging 必须是映射")
+        gui_level, gui_category = log_raw.get("gui_level", "DEBUG"), log_raw.get("gui_category", "all")
+        if not isinstance(gui_level, str) or not isinstance(gui_category, str):
+            raise ConfigError("logging.gui_level/gui_category 必须是文本")
+        gui_level, gui_category = gui_level.strip().upper(), gui_category.strip().lower()
+        if gui_level not in ("DEBUG", "INFO", "WARNING", "ERROR") or gui_category not in ("all", *CATEGORY_LABELS):
+            raise ConfigError("日志显示等级或类型无效")
         logging_settings = LoggingSettings(
             performance=bool(log_raw.get("performance", False)),
+            gui_level=gui_level, gui_category=gui_category,
         )
         battle = BattleSettings(
             poll_interval=float(data["battle"].get("poll_interval", 5.0)),
@@ -622,6 +721,9 @@ class ConfigManager:
     def validate(config: AppConfig) -> None:
         if config.version < 1:
             raise ConfigError("version 必须 >= 1")
+        if (config.logging.gui_level not in ("DEBUG", "INFO", "WARNING", "ERROR")
+                or config.logging.gui_category not in ("all", *CATEGORY_LABELS)):
+            raise ConfigError("日志显示等级或类型无效")
         if config.automation.power_threshold < 0:
             raise ConfigError("power_threshold 必须是数字且不能为负")
         refresh_limit = config.automation.max_consecutive_refreshes

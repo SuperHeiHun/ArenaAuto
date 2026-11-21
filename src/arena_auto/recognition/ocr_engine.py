@@ -23,6 +23,7 @@ import numpy as np
 from arena_auto.exceptions import OCRProviderError
 from arena_auto.models.config import OcrSettings
 from arena_auto.models.recognition import OCRBox, Region
+from arena_auto.logging.categories import FLOW_TIMING, OCR_TIMING
 from arena_auto.recognition.ocr import (
     OCRProvider,
     parse_power,
@@ -50,12 +51,12 @@ def perf_enabled() -> bool:
     return _perf_enabled
 
 
-def perf_log(message: str, elapsed_ms: float) -> None:
+def perf_log(message: str, elapsed_ms: float, *, category: str = FLOW_TIMING) -> None:
     if not _perf_enabled:
         return
     line = f"[PERF] {message} = {elapsed_ms:.1f}ms"
-    logger.debug(line)
-    perf_logger.info(line)
+    logger.debug(line, extra={"log_category": category})
+    perf_logger.info(line, extra={"log_category": category})
 
 
 def resolve_gpu(device: str) -> bool:
@@ -283,7 +284,7 @@ class OcrEngine(OCRProvider):
             label = getattr(self._provider, "device_label", None)
             self._device_label = label if isinstance(label, str) else "CPU"
             elapsed = (time.perf_counter() - started) * 1000.0
-            perf_log(f"OCR init ({getattr(self._provider, 'name', '?')})", elapsed)
+            perf_log(f"OCR init ({getattr(self._provider, 'name', '?')})", elapsed, category=OCR_TIMING)
             logger.info(
                 "OCR Ready (%s) device=%s init=%.0fms",
                 getattr(self._provider, "name", "?"),
@@ -330,12 +331,12 @@ class OcrEngine(OCRProvider):
                     self._timeout_ms,
                 )
             self.monitor.record(elapsed, ok=True, timeout=timeout)
-            perf_log("OCR full", elapsed)
+            perf_log("OCR full", elapsed, category=OCR_TIMING)
             return boxes
         except OCRProviderError as exc:
             elapsed = (time.perf_counter() - started) * 1000.0
             self.monitor.record(elapsed, ok=False)
-            perf_log("OCR full (failed)", elapsed)
+            perf_log("OCR full (failed)", elapsed, category=OCR_TIMING)
             logger.warning("OCR 失败: %s", exc)
             return []
         except Exception as exc:  # noqa: BLE001
@@ -393,7 +394,7 @@ class OcrEngine(OCRProvider):
             cached = self._cache_get(cache_key, roi)
             if cached is not None:
                 self.monitor.record(0.05, ok=True, cache_hit=True)
-                perf_log(f"OCR cache hit [{cache_key}]", 0.05)
+                perf_log(f"OCR cache hit [{cache_key}]", 0.05, category=OCR_TIMING)
                 if detail:
                     return list(cached.boxes), cached.text
                 return list(cached.boxes), cached.text
@@ -430,7 +431,8 @@ class OcrEngine(OCRProvider):
         except Exception as exc:  # noqa: BLE001
             elapsed = (time.perf_counter() - started) * 1000.0
             self.monitor.record(elapsed, ok=False)
-            logger.info("OCR ROI 耗时：预处理 %.0fms；推理/等待 %.0fms；失败", preprocess_ms, elapsed)
+            logger.info("OCR ROI 耗时：预处理 %.0fms；推理/等待 %.0fms；失败", preprocess_ms, elapsed,
+                        extra={"log_category": OCR_TIMING})
             logger.warning("ROI OCR 异常: %s", exc)
             return [], ""
         elapsed = (time.perf_counter() - started) * 1000.0
@@ -441,8 +443,9 @@ class OcrEngine(OCRProvider):
             self.monitor.record(elapsed, ok=True)
         text = " ".join(b.text for b in boxes)
         logger.info("OCR ROI 耗时：预处理 %.0fms；推理/等待 %.0fms；输入=%s；强制新读=%s",
-                    preprocess_ms, elapsed, "预处理" if preprocess else "原图", force)
-        perf_log(f"OCR roi [{cache_key or 'anon'}]", elapsed)
+                    preprocess_ms, elapsed, "预处理" if preprocess else "原图", force,
+                    extra={"log_category": OCR_TIMING})
+        perf_log(f"OCR roi [{cache_key or 'anon'}]", elapsed, category=OCR_TIMING)
         if cache_key and self._cache_enabled:
             self._cache_put(cache_key, roi, boxes, text)
         return boxes, text
