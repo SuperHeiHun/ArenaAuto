@@ -551,6 +551,8 @@ pyinstaller --clean ArenaAuto.spec
 
 推荐使用 `scripts/build.py`：每次干净构建，并检查 EXE 内嵌图标、GUI 子系统及随包窗口图标。Windows 下启动 ADB / Tesseract 子进程会禁用控制台窗口，避免弹出 CMD。如果资源管理器或任务栏仍显示旧图标，可把新包完整解压到新目录，并重新固定对应的程序。不要只复制 `ArenaAuto.exe`，它需要同目录的 `_internal`。
 
+更新或合并本地试用包时，先关闭程序，再将已验证的完整包整理到 `dist/ArenaAuto/`。保留使用中的 `config/`、`data/`、`logs/`、`debug/` 和自定义模板；清理其他测试包前先备份这些运行数据，勿把试验目录中的个人配置当作可再生成的构建缓存。`build/` 内的 PyInstaller 中间产物可以重新构建；源码测试与还原标签无需随测试包一起删除。
+
 ### GitHub Actions 构建与发布
 
 - `main` 推送、面向 `main` 的 PR、手动运行以及 `v*` 标签均会构建 Windows x64 版本。
