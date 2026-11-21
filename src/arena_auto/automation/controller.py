@@ -37,6 +37,7 @@ from arena_auto.recognition.detector import (
     ChallengeCountReader,
     PowerReader,
     ScreenDetector,
+    is_placeholder_power_region,
 )
 from arena_auto.recognition.ocr import OCRProvider, create_ocr_provider
 from arena_auto.recognition.auto_targeting import AutoTargeting
@@ -90,6 +91,9 @@ class _RuntimeContext:
     arena_frame: Optional[np.ndarray] = None
     prepare_frame: Optional[np.ndarray] = None
     prepare_frame_at: float = 0.0
+    consecutive_refreshes: int = 0
+    refresh_frame: Optional[np.ndarray] = None
+    refresh_regions: List[Tuple[int, int, int, int]] = field(default_factory=list)
     result_scene_change: SettledSceneChange = field(default_factory=SettledSceneChange)
 
 
@@ -417,6 +421,7 @@ class AutomationController:
             AutomationState.DETECT_SCREEN: self._state_detect_screen,
             AutomationState.ARENA: self._state_arena,
             AutomationState.SELECT_OPPONENT: self._state_select_opponent,
+            AutomationState.WAIT_REFRESH: self._state_wait_refresh,
             AutomationState.WAIT_PREPARE: self._state_wait_prepare,
             AutomationState.PREPARE: self._state_prepare,
             AutomationState.START_BATTLE: self._state_start_battle,
@@ -628,13 +633,20 @@ class AutomationController:
         if selected is None:
             self._log(
                 "WARNING",
-                f"没有战力 <= 阈值的对手: {powers}，等待刷新",
+                f"没有战力 <= 阈值的对手: {powers}",
             )
-            self.sm.transition(AutomationState.ARENA)
-            self._wait(self.config.automation.poll_interval)
+            if self.config.automation.max_consecutive_refreshes == 0:
+                self._log("INFO", "自动刷新已关闭，等待游戏刷新")
+                self.sm.transition(AutomationState.ARENA)
+                self._wait(self.config.automation.poll_interval)
+            else:
+                self._refresh_opponents(opponents)
             return
 
         assert selected.power is not None
+        self.ctx.consecutive_refreshes = 0
+        self.ctx.refresh_frame = None
+        self.ctx.refresh_regions = []
         self.ctx.target = selected
         self._log(
             "INFO",
@@ -673,6 +685,139 @@ class AutomationController:
             self.sm.transition(AutomationState.BUY_CHALLENGE)
             return
         self.sm.transition(AutomationState.WAIT_PREPARE)
+
+    def _refresh_opponents(self, opponents: List[Opponent]) -> None:
+        """Refresh only a completely verified high-power list, with fresh button checks."""
+        limit = self.config.automation.max_consecutive_refreshes
+        if self.ctx.consecutive_refreshes >= limit:
+            self._log("INFO", f"连续刷新已达上限 {limit}，停止自动化")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        if (not opponents or [o.id for o in opponents] != list(range(1, len(opponents) + 1))
+                or any(o.power is None or o.power <= self.config.automation.power_threshold for o in opponents)):
+            self._log("ERROR", "对手战力不完整或并非全部超阈值，禁止刷新")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        if self.config.automation.auto_targeting:
+            cards = self.auto_targeting.last_cards
+            if ([c.opponent.id for c in cards] != [o.id for o in opponents]
+                    or not all(c.power_verified for c in cards)):
+                self._log("ERROR", "完整卡片尚未全部通过战力复核，禁止刷新")
+                self.sm.transition(AutomationState.STOPPED)
+                return
+        else:
+            configured = [c for c in self.config.opponents if not is_placeholder_power_region(c.power_region)]
+            if ([(c.id, c.power_region) for c in configured] != [(o.id, o.power_region) for o in opponents]):
+                self._log("ERROR", "固定 ROI 对手未全部读取，禁止刷新")
+                self.sm.transition(AutomationState.STOPPED)
+                return
+        baseline = self.auto_targeting.last_image if self.config.automation.auto_targeting else self.ctx.screenshot
+        image = self._shot()
+        if self.stop_event.is_set():
+            raise StoppedError("用户停止")
+        if self.detector.detect(image) != ScreenKind.ARENA:
+            self._log("ERROR", "刷新前不是竞技场列表页，禁止点击/确认弹窗")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        result = self.buttons.find_refresh(image)
+        if not result.found:
+            self._log("ERROR", "无法可靠定位对手刷新按钮，停止，不盲点坐标")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        # A separate fresh frame confirms the same button after page/OCR work.
+        fresh = self._shot()
+        if self.stop_event.is_set():
+            raise StoppedError("用户停止")
+        current = self.buttons.find_refresh(fresh)
+        from arena_auto.recognition.frame_guard import regions_unchanged
+
+        regions = [o.power_region for o in opponents]
+        if not self.config.automation.auto_targeting:
+            regions = [self.scaler.scale_region(r) for r in regions]
+        if (not current.found or current.bbox != result.bbox
+                or any(is_placeholder_power_region(o.power_region) for o in opponents)
+                or not regions_unchanged(baseline, image, regions)
+                or not regions_unchanged(image, fresh, [result.bbox, *regions])):
+            self._log("ERROR", "刷新按钮或战力区域在点击前变化，取消刷新")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        if self.config.automation.auto_targeting and not all(
+                self.auto_targeting.verify_target(fresh, o) for o in opponents):
+            self._log("ERROR", "刷新前卡片已变化，取消刷新")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        try:
+            self._safe_tap(*current.center, label="刷新对手")
+        except AdbError as exc:
+            self._log("ERROR", f"刷新点击结果不确定：{exc}；停止，不重发刷新")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        if self.config.automation.dry_run:
+            self._log("INFO", "测试模式仅记录刷新点击，不消耗次数，不循环同一列表")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        self.ctx.consecutive_refreshes += 1
+        self._log("INFO", f"连续刷新：{self.ctx.consecutive_refreshes}/{limit}")
+        self.ctx.target = None
+        self.ctx.auto_selection_attempts = 0
+        if self.ctx.consecutive_refreshes >= limit:
+            self._log("INFO", "达到连续刷新上限，立即停止，不再检查新一批对手")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        self.ctx.refresh_frame = fresh
+        self.ctx.refresh_regions = regions
+        self.sm.transition(AutomationState.WAIT_REFRESH)
+
+    def _state_wait_refresh(self) -> None:
+        try:
+            self._wait_refresh_once()
+        except StoppedError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Never let failed refresh verification escape into generic recovery
+            # and then the ordinary automatic challenge-purchase flow.
+            self._log("ERROR", f"刷新后验证失败：{exc}；停止，不重发或进入购买恢复")
+            self.sm.transition(AutomationState.STOPPED)
+
+    def _wait_refresh_once(self) -> None:
+        """Wait for actual numeric-panel change; never repeat a refresh tap here."""
+        if self.sm.has_timed_out(self.config.timeouts.prepare):
+            self._log("ERROR", "刷新后列表未确认变化，停止，不重复点击或确认付费")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        if self._wait(.5):
+            raise StoppedError("用户停止")
+        image = self._shot()
+        if self.stop_event.is_set():
+            raise StoppedError("用户停止")
+        if self.ctx.refresh_frame is None or image.shape != self.ctx.refresh_frame.shape:
+            self._log("ERROR", "刷新等待证据缺失或截图尺寸变化，停止")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        kind = self.detector.detect(image)
+        if kind == ScreenKind.PURCHASE:
+            self._log("WARNING", "刷新后出现付费/购买弹窗，停止，不自动确认")
+            self.sm.transition(AutomationState.STOPPED)
+            return
+        if kind == ScreenKind.ARENA:
+            for x, y, w, h in self.ctx.refresh_regions:
+                old = self.ctx.refresh_frame[y:y + h, x:x + w].mean(axis=2)
+                new = image[y:y + h, x:x + w].mean(axis=2)
+                if float(((old > 50) & (new < old * .8)).mean()) > .5:
+                    self._log("INFO", "刷新后战力区域大范围变暗，等待遮罩/过渡消失，不进入购买流程")
+                    return
+        from arena_auto.recognition.frame_guard import regions_unchanged
+
+        if (kind == ScreenKind.ARENA and self.ctx.refresh_frame is not None
+                and self.ctx.refresh_regions and image.shape == self.ctx.refresh_frame.shape
+                and not regions_unchanged(self.ctx.refresh_frame, image, self.ctx.refresh_regions)):
+            self._log("INFO", "刷新后战力区域已变化，重新读取挑战次数和新列表")
+            self.ctx.refresh_frame = None
+            self.ctx.refresh_regions = []
+            self.ctx.arena_frame = image
+            self.sm.transition(AutomationState.ARENA)
+        else:
+            self._log("INFO", "等待刷新后的新列表，不重复点击刷新")
 
     def shot_safe(self) -> np.ndarray:
         return self._shot()

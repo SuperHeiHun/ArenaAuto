@@ -154,6 +154,11 @@ class MainWindow(QMainWindow):
         self.threshold_edit = QLineEdit()
         self.threshold_edit.setPlaceholderText("例如 2000000")
         param_form.addRow("战力阈值", self.threshold_edit)
+        self.refresh_limit_spin = QSpinBox()
+        self.refresh_limit_spin.setRange(0, 999)
+        self.refresh_limit_spin.setSpecialValueText("关闭自动刷新")
+        self.refresh_limit_spin.setToolTip("全部完整识别的对手均超阈值时点击刷新；达到次数立即停止，不再检查最后一批。找到合格对手后清零。0 表示只等待，不点击刷新；付费弹窗不会自动确认。")
+        param_form.addRow("连续刷新上限", self.refresh_limit_spin)
 
         self.poll_spin = QSpinBox()
         self.poll_spin.setRange(1, 120)
@@ -459,6 +464,7 @@ class MainWindow(QMainWindow):
     def _load_config_into_form(self) -> None:
         cfg = self.config
         self.threshold_edit.setText(str(cfg.automation.power_threshold))
+        self.refresh_limit_spin.setValue(cfg.automation.max_consecutive_refreshes)
         self.poll_spin.setValue(int(cfg.battle.poll_interval))
         self.dry_run_check.setChecked(cfg.automation.dry_run)
         self.auto_target_check.setChecked(cfg.automation.auto_targeting)
@@ -502,6 +508,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "OCR 设备", "rapidocr 请使用 directml、auto 或 cpu；CUDA 请选 easyocr。")
             return False
         cfg.automation.power_threshold = threshold
+        cfg.automation.max_consecutive_refreshes = self.refresh_limit_spin.value()
         cfg.battle.poll_interval = float(self.poll_spin.value())
         cfg.automation.poll_interval = float(self.poll_spin.value())
         cfg.automation.dry_run = self.dry_run_check.isChecked()
@@ -808,6 +815,7 @@ class MainWindow(QMainWindow):
         self.save_cfg_btn.setEnabled(False)
         self.auto_target_check.setEnabled(False)
         self.auto_save_check.setEnabled(False)
+        self.refresh_limit_spin.setEnabled(False)
         for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.ocr_lang_combo, self.gpu_fallback_check):
             control.setEnabled(False)
         # OCR loads on the automation worker thread — keep the GUI free.
@@ -820,6 +828,8 @@ class MainWindow(QMainWindow):
     def _confirm_automation_start(self) -> bool:
         if self.config.automation.auto_targeting:
             mode = "测试模式：只记录操作，不会真实点击。" if self.config.automation.dry_run else "实际运行：将按识别结果执行点击。"
+            refresh_limit = self.config.automation.max_consecutive_refreshes
+            refresh = f"上限 {refresh_limit} 次，达到后立即停止" if refresh_limit else "已关闭（等待游戏刷新）"
             purchase = (f"已开启，上限 {self.config.purchase.max_per_session} 次/会话"
                         if self.config.purchase.enabled else "已关闭")
             save_config = (
@@ -834,6 +844,7 @@ class MainWindow(QMainWindow):
                 "未找到模板时会使用 OCR，不必先执行半自动配置。\n"
                 "识别不可靠时安全停止，不会猜测坐标或胜负。\n\n"
                 f"战力阈值：{self.config.automation.power_threshold:,}\n"
+                f"连续刷新：{refresh}\n刷新按钮只用可靠图标定位，不自动确认刷新付费。\n"
                 f"自动购买：{purchase}\n配置保存：{save_config}\n{mode}\n\n是否开始？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
@@ -863,6 +874,7 @@ class MainWindow(QMainWindow):
         self.save_cfg_btn.setEnabled(True)
         self.auto_target_check.setEnabled(True)
         self.auto_save_check.setEnabled(True)
+        self.refresh_limit_spin.setEnabled(True)
         for control in (self.provider_combo, self.ocr_device_combo, self.gpu_device_spin, self.ocr_lang_combo, self.gpu_fallback_check):
             control.setEnabled(True)
         self.statusBar().showMessage("已停止")

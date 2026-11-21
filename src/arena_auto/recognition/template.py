@@ -105,6 +105,10 @@ class TemplateRecognizer:
             else:
                 root = self._base_dir
             path = root / path
+            if self._base_dir is None and not path.is_file():
+                from arena_auto.paths import get_resource_path
+
+                path = get_resource_path(entry.path)
         return path
 
     def is_loaded(self, name: str) -> bool:

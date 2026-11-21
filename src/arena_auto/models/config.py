@@ -43,6 +43,7 @@ class AutomationSettings:
     auto_targeting_max_attempts: int = 2
     # UI: 自动初始化成功后，把识别到的对手 ROI/点击写入 config.yaml。
     auto_targeting_save_config: bool = True
+    max_consecutive_refreshes: int = 3  # 0 disables clicking refresh; stop immediately at the limit.
 
 
 @dataclass
@@ -264,6 +265,7 @@ class AppConfig:
         default_factory=lambda: {
             "go_win": TemplateEntry(path="resources/templates/go_win.png", threshold=0.82),
             "exit": TemplateEntry(path="resources/templates/exit.png", threshold=0.82),
+            "refresh_opponents": TemplateEntry(path="resources/templates/refresh_opponents.png", threshold=0.95),
             "buy_challenge": TemplateEntry(
                 path="resources/templates/buy_challenge.png", threshold=0.82
             ),

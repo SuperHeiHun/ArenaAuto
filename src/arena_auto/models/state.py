@@ -28,6 +28,7 @@ class AutomationState(Enum):
     RECOVERY = auto()
     STOPPED = auto()
     ERROR = auto()
+    WAIT_REFRESH = auto()
 
 
 class ScreenKind(Enum):

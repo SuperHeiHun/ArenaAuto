@@ -303,6 +303,9 @@ class ConfigManager:
             raise ConfigError("power_threshold 必须是数字") from exc
         if power_threshold < 0:
             raise ConfigError("power_threshold 不能为负数")
+        refresh_value = data["automation"].get("max_consecutive_refreshes", 3)
+        if not str(refresh_value).strip().isdigit() or not 0 <= int(refresh_value) <= 999:
+            raise ConfigError("max_consecutive_refreshes 必须是 0～999 的整数")
 
         adb = AdbConfig(
             executable=str(data["adb"].get("executable", "adb")),
@@ -312,6 +315,7 @@ class ConfigManager:
         )
         automation = AutomationSettings(
             power_threshold=power_threshold,
+            max_consecutive_refreshes=int(refresh_value),
             click_delay=float(data["automation"].get("click_delay", 0.3)),
             poll_interval=float(data["automation"].get("poll_interval", 5.0)),
             dry_run=bool(data["automation"].get("dry_run", False)),
@@ -608,6 +612,9 @@ class ConfigManager:
             raise ConfigError("version 必须 >= 1")
         if config.automation.power_threshold < 0:
             raise ConfigError("power_threshold 必须是数字且不能为负")
+        refresh_limit = config.automation.max_consecutive_refreshes
+        if type(refresh_limit) is not int or not 0 <= refresh_limit <= 999:
+            raise ConfigError("max_consecutive_refreshes 必须是 0～999 的整数")
         if config.battle.poll_interval <= 0:
             raise ConfigError("battle.poll_interval 必须大于 0")
         if config.battle.result_ocr_interval <= 0:
@@ -624,22 +631,22 @@ class ConfigManager:
     # ---------------------------------------------------------------- helpers
     def missing_templates(self) -> List[str]:
         """Return template names whose PNG files are missing on disk."""
-        from arena_auto.paths import get_app_root
-
         missing: List[str] = []
         for name, entry in self.config.templates.items():
-            path = Path(entry.path)
-            if not path.is_absolute():
-                path = get_app_root() / path
+            path = self.get_template_path(name)
             if not path.is_file():
                 missing.append(name)
         return sorted(missing)
 
     def get_template_path(self, name: str) -> Path:
+        from arena_auto.paths import get_app_root, get_resource_path
+
         entry = self.config.templates.get(name)
         if entry is None:
             raise ConfigError(f"未配置模板: {name}")
         path = Path(entry.path)
         if not path.is_absolute():
             path = get_app_root() / path
+            if not path.is_file():
+                path = get_resource_path(entry.path)
         return path

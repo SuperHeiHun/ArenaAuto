@@ -1138,6 +1138,25 @@ class ButtonFinder:
     def find_go_win(self, screenshot: np.ndarray) -> DetectionResult:
         return self.find(screenshot, "go_win", self.config.profile.go_win_text)
 
+    def find_refresh(self, screenshot: np.ndarray) -> DetectionResult:
+        """Icon template only: never mistake an auto-refresh countdown for a button."""
+        entry = self.config.templates.get("refresh_opponents")
+        threshold = max(.95, entry.threshold if entry else .95)
+        result = self.templates.find(screenshot, "refresh_opponents", threshold=threshold)
+        if not result.found or result.confidence < threshold:
+            return DetectionResult(found=False)
+        x, y, w, h = result.bbox
+        height, width = screenshot.shape[:2]
+        if not (0 <= x < x + w <= width and 0 <= y < y + h <= height
+                and 0 < w <= width * .12 and 0 < h <= height * .2):
+            return DetectionResult(found=False)
+        if self._region_hint("refresh_opponents") is not None:
+            if not self._inside_region_hint(screenshot, result, "refresh_opponents"):
+                return DetectionResult(found=False)
+        elif not (x >= width * .4 and y + h <= height * .25):
+            return DetectionResult(found=False)
+        return result
+
     def find_exit(self, screenshot: np.ndarray, *, full_ocr: bool = True) -> DetectionResult:
         """Find 退出. full_ocr=False: template + region OCR only (RESULT path)."""
         return self.find(
