@@ -64,6 +64,7 @@ class AutoTargeting:
         self.last_reason = ""
         self.last_input = "原始截图"
         self.frame_cache = None
+        self.debug = None
 
     def _boxes(self, image: np.ndarray) -> List[OCRBox]:
         try:
@@ -405,7 +406,7 @@ class AutoTargeting:
                     confirmation_frame = screenshot_factory()
                     capture_ms = (time.perf_counter() - started) * 1000.0
                     self._check_stop(stop_event)
-                    from arena_auto.recognition.frame_guard import regions_unchanged
+                    from arena_auto.recognition.frame_guard import compare_regions, save_guard_evidence
 
                     ordered = [c.opponent.id for c in cards] == list(range(1, len(cards) + 1))
                     # Validate the whole list-side panel, including title and
@@ -413,7 +414,8 @@ class AutoTargeting:
                     left = max(0, min((c.region[0] for c in cards), default=0) - 32)
                     region = (left, 0, hint.shape[1] - left, hint.shape[0])
                     started = time.perf_counter()
-                    unchanged = cards and ordered and regions_unchanged(hint, confirmation_frame, [region])
+                    report = compare_regions(hint, confirmation_frame, [region]) if cards and ordered else None
+                    unchanged = report is not None and report.unchanged
                     logger.info("布局验证耗时：新截图 %.0fms；画面校验 %.0fms；复用=%s",
                                 capture_ms, (time.perf_counter() - started) * 1000.0, bool(unchanged))
                     if unchanged:
@@ -421,6 +423,11 @@ class AutoTargeting:
                         self.last_image = confirmation_frame
                     else:
                         logger.info("布局复用未通过：画面/列表变化，回退新截图整图 OCR")
+                        if report is not None:
+                            logger.info("布局复用拒绝原因：%s", report.describe())
+                            save_guard_evidence(self.debug, hint, confirmation_frame, report, "layout_rejected")
+                        else:
+                            logger.info("布局复用拒绝原因：%s", "未发现完整卡片" if not cards else "前序卡片不连续")
                         cards = self.scan(confirmation_frame)
                 else:
                     cards = self.scan(screenshot_factory())

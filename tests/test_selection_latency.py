@@ -243,3 +243,59 @@ def test_cached_button_outside_manual_roi_keeps_roi_first_behavior(tmp_path):
     ctrl.buttons._find_ocr_boxes = MagicMock(wraps=finder)
     ctrl.buttons.find_go_win(image)
     assert ctrl.buttons._find_ocr_boxes.call_args_list[1].args[0].shape == (50, 100, 3)
+
+
+@pytest.mark.parametrize("mode,reason", [
+    ("missing", "无备战前帧"),
+    ("expired", "备战证据过期"),
+    ("no_cache", "无同帧 OCR 缓存"),
+    ("no_button", "缓存中无合格按钮文字"),
+    ("outside_roi", "缓存按钮不在配置 ROI 内"),
+    ("changed", "最大变化位置"),
+])
+def test_prepare_logs_specific_reuse_failure_without_old_ocr(tmp_path, caplog, mode, reason):
+    import logging
+    from arena_auto.models.config import ButtonGeometry
+
+    ctrl, provider = controller(tmp_path)
+    old = np.full((200, 400, 3), 100, dtype=np.uint8)
+    fresh = old.copy()
+    provider.recognize.return_value = [OCRBox("去获胜", .9, (280, 130, 80, 30))]
+    if mode == "no_button":
+        provider.recognize.return_value = [OCRBox("备战", .9, (20, 20, 60, 30))]
+    if mode not in ("missing", "no_cache"):
+        ctrl.frame_cache.raw(old)
+    if mode != "missing":
+        ctrl.ctx.prepare_frame = old
+        ctrl.ctx.prepare_frame_at = time.monotonic() - (6 if mode == "expired" else 1)
+    if mode == "outside_roi":
+        ctrl.config.screen.reference_width = 400
+        ctrl.config.screen.reference_height = 200
+        ctrl.config.buttons["go_win"] = ButtonGeometry(region=(0, 0, 100, 50))
+    if mode == "changed":
+        fresh[30:60, 100:130] = 220
+    ctrl.adb.screenshot.return_value = fresh
+    provider.reset_mock()
+    with caplog.at_level(logging.INFO):
+        ctrl._state_prepare()
+    assert reason in caplog.text and "回退新图检测" in caplog.text
+    # Any newly recognized input is from the fresh frame or its crop, never old.
+    for call in provider.recognize.call_args_list:
+        assert call.args[0] is not old
+
+
+def test_layout_rejection_logs_region_and_saves_optional_evidence(caplog):
+    import logging
+
+    old, boxes = arena_scene()
+    auto, _ = targeting(old, boxes)
+    auto.debug = MagicMock()
+    auto.debug.enabled = True
+    changed = old.copy()
+    changed[560:590, 600:650] = 255
+    auto._read_power = MagicMock(return_value=121235)
+    with caplog.at_level(logging.INFO):
+        _, selected = auto.select(lambda: changed.copy(), 700000, layout_hint=old)
+    assert selected.id == 1
+    assert "布局复用拒绝原因" in caplog.text and "最大变化位置" in caplog.text
+    assert auto.debug.save.call_count == 3

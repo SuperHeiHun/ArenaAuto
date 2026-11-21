@@ -38,6 +38,12 @@ class AdbController:
         self._serial: str = self._config.serial or ""
         self._lock = threading.RLock()
         self._connected: bool = False
+        self._screenshot_at: Optional[float] = None
+        self._screenshot_serial = ""
+
+    def _clear_screenshot_connection(self) -> None:
+        self._screenshot_at = None
+        self._screenshot_serial = ""
 
     # ------------------------------------------------------------------ config
     @property
@@ -46,6 +52,7 @@ class AdbController:
 
     def update_config(self, config: AdbConfig) -> None:
         with self._lock:
+            self._clear_screenshot_connection()
             self._config = config
             if config.serial:
                 self._serial = config.serial
@@ -125,13 +132,17 @@ class AdbController:
                 **no_console_window_options(),
             )
         except FileNotFoundError as exc:
+            self._clear_screenshot_connection()
             raise AdbNotFoundError(str(exc)) from exc
         except subprocess.TimeoutExpired as exc:
+            self._clear_screenshot_connection()
             raise AdbError(f"ADB 命令超时: {' '.join(safe_args)}") from exc
         except OSError as exc:
+            self._clear_screenshot_connection()
             raise AdbError(f"ADB 执行失败: {exc}") from exc
 
         if completed.returncode != 0:
+            self._clear_screenshot_connection()
             err = (completed.stderr or b"").decode("utf-8", errors="replace")
             out = (completed.stdout or b"").decode("utf-8", errors="replace")
             message = err.strip() or out.strip() or f"exit={completed.returncode}"
@@ -175,6 +186,7 @@ class AdbController:
     def connect(self, serial: Optional[str] = None) -> bool:
         """Connect to a device (USB / Wi-Fi / emulator)."""
         with self._lock:
+            self._clear_screenshot_connection()
             if serial:
                 self._serial = serial
 
@@ -211,6 +223,7 @@ class AdbController:
 
     def disconnect(self) -> None:
         with self._lock:
+            self._clear_screenshot_connection()
             self._connected = False
             logger.info("ADB 断开连接: %s", self._serial or "-")
 
@@ -235,6 +248,7 @@ class AdbController:
 
         with self._lock:
             args = self._base_cmd() + ["connect", serial]
+            self._clear_screenshot_connection()
             try:
                 raw = self._run(args, timeout=timeout, check=False)
             except AdbError as exc:
@@ -288,6 +302,7 @@ class AdbController:
         code = parse_pair_code(pair_code).replace("-", "")
         serial = ep.serial()
         with self._lock:
+            self._clear_screenshot_connection()
             args = self._base_cmd() + ["pair", serial, code]
             try:
                 raw = self._run(args, timeout=timeout or 15.0, check=False)
@@ -307,6 +322,7 @@ class AdbController:
     def enable_tcpip(self, port: int = 5555, *, use_current_serial: bool = True) -> str:
         """Switch a USB-connected device to TCP mode (`adb -s USB tcpip PORT`)."""
         with self._lock:
+            self._clear_screenshot_connection()
             if use_current_serial and self._serial and ":" in self._serial:
                 raise AdbError("当前已是无线序列号，无法对其执行 tcpip")
             cmd = self._base_cmd()
@@ -323,6 +339,7 @@ class AdbController:
     def disconnect_wireless(self, serial: Optional[str] = None) -> None:
         """`adb disconnect [host:port]` — clears wireless endpoint only."""
         with self._lock:
+            self._clear_screenshot_connection()
             target = (serial or self._serial or "").strip()
             if not is_wireless_target(target):
                 return
@@ -338,8 +355,13 @@ class AdbController:
             return False
         try:
             out = self.shell("echo ok", timeout=5, check=True)
-            return "ok" in out
+            if "ok" in out:
+                return True
+            self._clear_screenshot_connection()
+            self._connected = False
+            return False
         except AdbError:
+            self._clear_screenshot_connection()
             self._connected = False
             return False
 
@@ -362,7 +384,11 @@ class AdbController:
     # ---------------------------------------------------------------- actions
     def screenshot(self) -> np.ndarray:
         """Capture screen as BGR ndarray via `exec-out screencap -p`."""
+        requested = time.perf_counter()
         with self._lock:
+            started = time.perf_counter()
+            captured_at = time.monotonic()
+            self._clear_screenshot_connection()
             if not self._serial:
                 raise ScreenshotError("未选择设备，无法截图")
             raw = self._run(
@@ -371,8 +397,11 @@ class AdbController:
                 check=True,
                 timeout=self._config.command_timeout,
             )
+            transport_ms = (time.perf_counter() - started) * 1000.0
             if not raw:
                 raise ScreenshotError("截图数据为空")
+            byte_count = len(raw)
+            decode_started = time.perf_counter()
             # Some Windows adb builds convert LF -> CRLF in binary streams.
             if b"\r\n" in raw and raw.count(b"\r\n") > raw.count(b"\n") // 2:
                 fixed = raw.replace(b"\r\n", b"\n")
@@ -382,22 +411,41 @@ class AdbController:
             image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
             if image is None:
                 raise ScreenshotError("截图解码失败")
+            self._screenshot_at = captured_at
+            self._screenshot_serial = self._serial
+            logger.info("ADB截图耗时：锁等待 %.0fms；命令/设备编码/传输 %.0fms；PNG修复/解码 %.0fms；数据 %s bytes",
+                        (started - requested) * 1000.0, transport_ms,
+                        (time.perf_counter() - decode_started) * 1000.0, byte_count)
             return image
 
     def tap(self, x: int, y: int, delay: float = 0.0) -> None:
-        """Tap at device coordinates with connection check + optional delay."""
+        """One recent successful capture may replace the extra connection probe."""
         with self._lock:
-            if not self.is_connected():
+            started = time.perf_counter()
+            # Start-time age is conservative; never let repeated taps extend
+            # this three-second, same-device, single-use evidence window.
+            age = time.monotonic() - self._screenshot_at if self._screenshot_at is not None else None
+            reuse = (self._connected and bool(self._serial) and self._screenshot_serial == self._serial
+                     and age is not None and 0.0 <= age <= 3.0)
+            self._clear_screenshot_connection()
+            if not reuse and not self.is_connected():
                 raise AdbDisconnectedError("点击前设备未连接")
+            probe_ms = (time.perf_counter() - started) * 1000.0
             x, y = int(x), int(y)
             logger.debug("tap(%s, %s)", x, y)
             try:
+                command_started = time.perf_counter()
                 self.shell(f"input tap {x} {y}", timeout=10)
             except AdbError as exc:
                 self._connected = False
                 raise AdbError(f"点击失败 ({x},{y}): {exc}") from exc
+            command_ms = (time.perf_counter() - command_started) * 1000.0
+            wait_started = time.perf_counter()
             if delay and delay > 0:
                 time.sleep(delay)
+            logger.info("ADB点击耗时：连接检查 %.0fms（%s）；点击命令 %.0fms；点击等待 %.0fms",
+                        probe_ms, f"复用近期截图 {age:.2f}s" if reuse else "主动探测",
+                        command_ms, (time.perf_counter() - wait_started) * 1000.0)
 
     def swipe(
         self,
@@ -408,6 +456,7 @@ class AdbController:
         duration: int = 300,
     ) -> None:
         with self._lock:
+            self._clear_screenshot_connection()
             if not self.is_connected():
                 raise AdbDisconnectedError("滑动前设备未连接")
             try:
@@ -421,6 +470,7 @@ class AdbController:
 
     def keyevent(self, key: int | str) -> None:
         with self._lock:
+            self._clear_screenshot_connection()
             if not self.is_connected():
                 raise AdbDisconnectedError("按键前设备未连接")
             self.shell(f"input keyevent {int(key)}", timeout=10)

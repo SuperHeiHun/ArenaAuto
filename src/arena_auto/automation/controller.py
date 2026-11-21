@@ -148,6 +148,7 @@ class AutomationController:
         # Manual ROI mode retains its original page recognition path.
         self.detector.frame_cache = self.frame_cache if self.config.automation.auto_targeting else None
         self.auto_targeting.frame_cache = self.frame_cache
+        self.auto_targeting.debug = self.debug
         self.buttons.frame_cache = self.frame_cache if self.config.automation.auto_targeting else None
 
     @property
@@ -397,10 +398,14 @@ class AutomationController:
             perf_log("ADB screenshot", elapsed)
         except Exception:  # noqa: BLE001
             pass
+        processing_started = time.perf_counter()
         self.scaler.maybe_update_from_image(image)
         self.ctx.screenshot = image
         self.ctx.screenshot_at = captured_at
         self._emit_screenshot(image)
+        logger.info("截图流程耗时：获取 %.0fms；缩放/状态/界面回调 %.0fms；总计 %.0fms",
+                    elapsed, (time.perf_counter() - processing_started) * 1000.0,
+                    (time.perf_counter() - started) * 1000.0)
         return image
 
     def _step(self) -> None:
@@ -793,19 +798,31 @@ class AutomationController:
         old_frame = self.ctx.prepare_frame
         self.ctx.prepare_frame = None
         observed_button = None
-        if (old_frame is not None and time.monotonic() - self.ctx.prepare_frame_at <= 5.0
-                and self.frame_cache.peek(old_frame) is not None):
+        age = time.monotonic() - self.ctx.prepare_frame_at
+        if old_frame is None:
+            reason = "无备战前帧"
+        elif age > 5.0:
+            reason = f"备战证据过期（{age:.2f}s）"
+        else:
             # Read evidence before _shot invalidates the same-frame OCR cache.
-            observed_button = self.buttons.cached_go_win(old_frame)
+            observed_button, reason = self.buttons.cached_go_win_evidence(old_frame)
         image = self._shot()
-        from arena_auto.recognition.frame_guard import regions_unchanged
+        from arena_auto.recognition.frame_guard import compare_regions, save_guard_evidence
 
-        if (observed_button is not None and observed_button.found
-                and regions_unchanged(old_frame, image,
-                                      [(0, 0, image.shape[1], image.shape[0]), observed_button.bbox])):
+        report = None
+        if observed_button is not None and observed_button.found:
+            started = time.perf_counter()
+            report = compare_regions(old_frame, image,
+                                     [(0, 0, image.shape[1], image.shape[0]), observed_button.bbox])
+            self._log("INFO", f"备战画面校验耗时 {(time.perf_counter() - started) * 1000.0:.0f}ms")
+            reason = report.describe()
+        if report is not None and report.unchanged:
             result = observed_button
             self._log("INFO", "备战按钮复用：新截图验证页面未变化，跳过重复 OCR")
         else:
+            self._log("INFO", f"备战按钮复用未命中：{reason}；回退新图检测")
+            if report is not None:
+                save_guard_evidence(self.debug, old_frame, image, report, "prepare_rejected")
             result = self.buttons.find_go_win(image)
         if result.found:
             self._log("INFO", "检测到「去获胜」")

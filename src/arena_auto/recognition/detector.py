@@ -996,12 +996,19 @@ class ButtonFinder:
 
     def cached_go_win(self, screenshot):
         """Return only already computed OCR evidence; never recognize old pixels."""
+        result, _ = self.cached_go_win_evidence(screenshot)
+        return result
+
+    def cached_go_win_evidence(self, screenshot):
+        """Cache-only lookup plus reason, without doing OCR or template work."""
         if self.frame_cache is None or self.frame_cache.peek(screenshot) is None:
-            return None
+            return None, "无同帧 OCR 缓存"
         result = self._full_ocr_result(screenshot, self.config.profile.go_win_text, "go_win")
-        if result is not None and self._inside_region_hint(screenshot, result, "go_win"):
-            return result
-        return None
+        if result is None:
+            return None, "缓存中无合格按钮文字"
+        if not self._inside_region_hint(screenshot, result, "go_win"):
+            return None, "缓存按钮不在配置 ROI 内"
+        return result, "缓存按钮可用"
 
     def find(
         self,
