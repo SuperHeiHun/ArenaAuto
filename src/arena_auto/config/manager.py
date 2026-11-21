@@ -381,6 +381,7 @@ class ConfigManager:
             poll_interval=float(data["battle"].get("poll_interval", 5.0)),
             max_duration=float(data["battle"].get("max_duration", 300.0)),
             result_ocr_interval=float(data["battle"].get("result_ocr_interval", 15.0)),
+            result_scene_probe=bool(data["battle"].get("result_scene_probe", True)),
         )
         purchase = PurchaseSettings(
             enabled=bool(data["purchase"].get("enabled", True)),

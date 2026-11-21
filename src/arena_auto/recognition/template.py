@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -39,9 +40,20 @@ class TemplateRecognizer:
         self._gray_src_id: Optional[int] = None
         self._gray_src: Optional[np.ndarray] = None
         self._gray_cache: Optional[np.ndarray] = None
+        self._scaled_templates = {}
+        self._match_frame = None
+        self._match_cache = {}
+        self._last_hits = {}
+
+    def _invalidate_matches(self) -> None:
+        self._scaled_templates.clear()
+        self._match_frame = None
+        self._match_cache.clear()
+        self._last_hits.clear()
 
     # ------------------------------------------------------------------ config
     def register(self, name: str, entry: TemplateEntry) -> None:
+        self._invalidate_matches()
         self._entries[name] = entry
         self._cache.pop(name, None)
         self._runtime_templates.pop(name, None)
@@ -57,6 +69,7 @@ class TemplateRecognizer:
         if float(gray.std()) < 1.0:
             return False
         self._runtime_templates[name] = image.copy()
+        self._invalidate_matches()
         entry = self._entries[name]
         self._runtime_signatures[name] = (entry.path, entry.threshold)
         self._cache.pop(name, None)
@@ -64,6 +77,7 @@ class TemplateRecognizer:
         return True
 
     def set_entries(self, templates: Dict[str, TemplateEntry]) -> None:
+        self._invalidate_matches()
         # Preserve learned templates on a routine reload, but explicit path or
         # threshold changes invalidate them so manual configuration still wins.
         for name in list(self._runtime_templates):
@@ -111,6 +125,7 @@ class TemplateRecognizer:
         if not force and name in self._runtime_templates:
             return self._runtime_templates[name]
         if force:
+            self._invalidate_matches()
             self._runtime_templates.pop(name, None)
             self._runtime_signatures.pop(name, None)
         if not force and name in self._cache:
@@ -177,6 +192,22 @@ class TemplateRecognizer:
         if screenshot is None or screenshot.size == 0:
             return DetectionResult(found=False, template_name=template_name)
 
+        if self._match_frame is not screenshot:
+            self._match_frame = screenshot
+            self._match_cache.clear()
+        entry = self._entries.get(template_name)
+        signature = (entry.path, entry.threshold) if entry is not None else None
+        key = (template_name, threshold, signature, self.multi_scale, self.scales)
+        if key not in self._match_cache:
+            started = time.perf_counter()
+            self._match_cache[key] = self._find_uncached(screenshot, template_name, threshold)
+            from arena_auto.recognition.ocr_engine import perf_log
+
+            perf_log(f"Template {template_name}", (time.perf_counter() - started) * 1000.0)
+        return self._match_cache[key]
+
+    def _find_uncached(self, screenshot, template_name, threshold):
+
         entry = None
         try:
             entry = self.entry(template_name)
@@ -201,22 +232,50 @@ class TemplateRecognizer:
             )
 
         screen_gray = self._to_gray(screenshot)
-        template_gray = template if template.ndim == 2 else cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+        scaled_key = (template_name, id(template), self.scales, self.multi_scale)
+        if scaled_key not in self._scaled_templates:
+            template_gray = template if template.ndim == 2 else cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            pyramid = []
+            for scale in candidate_scales:
+                tw = int(round(template_gray.shape[1] * scale))
+                th = int(round(template_gray.shape[0] * scale))
+                if tw < 5 or th < 5:
+                    continue
+                scaled = template_gray if scale == 1.0 else cv2.resize(
+                    template_gray, (tw, th), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+                )
+                pyramid.append(scaled)
+            self._scaled_templates[scaled_key] = pyramid
 
-        for scale in candidate_scales:
-            tw = int(round(template_gray.shape[1] * scale))
-            th = int(round(template_gray.shape[0] * scale))
-            if tw < 5 or th < 5 or tw > screen_gray.shape[1] or th > screen_gray.shape[0]:
+        # A prior near-perfect match supplies only a search hint, never a click
+        # coordinate. Accept a new local match only at >= .98; otherwise run
+        # the original full-frame search at every scale.
+        hint = self._last_hits.get(template_name)
+        if hint is not None and hint[0] == screenshot.shape:
+            x, y, w, h = hint[1]
+            pad = max(w, h, 32)
+            left, top = max(0, x - pad), max(0, y - pad)
+            roi = screen_gray[top:min(screen_gray.shape[0], y + h + pad),
+                              left:min(screen_gray.shape[1], x + w + pad)]
+            for scaled in self._scaled_templates[scaled_key]:
+                th, tw = scaled.shape[:2]
+                if th > roi.shape[0] or tw > roi.shape[1]:
+                    continue
+                match = cv2.matchTemplate(roi, scaled, cv2.TM_CCOEFF_NORMED)
+                _, confidence, _, location = cv2.minMaxLoc(match)
+                if confidence >= max(thr, 0.98):
+                    bbox = (left + location[0], top + location[1], tw, th)
+                    self._last_hits[template_name] = (screenshot.shape, bbox)
+                    return DetectionResult(True, float(confidence), bbox, template_name)
+
+        for scaled in self._scaled_templates[scaled_key]:
+            th, tw = scaled.shape[:2]
+            if tw > screen_gray.shape[1] or th > screen_gray.shape[0]:
                 continue
-            if scale == 1.0:
-                scaled = template_gray
-            else:
-                interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
-                scaled = cv2.resize(template_gray, (tw, th), interpolation=interp)
             try:
                 match = cv2.matchTemplate(screen_gray, scaled, cv2.TM_CCOEFF_NORMED)
             except cv2.error as exc:
-                logger.debug("matchTemplate failed scale=%s: %s", scale, exc)
+                logger.debug("matchTemplate failed size=%s: %s", (tw, th), exc)
                 continue
             _, max_val, _, max_loc = cv2.minMaxLoc(match)
             if float(max_val) > best_conf:
@@ -242,6 +301,8 @@ class TemplateRecognizer:
 
         x, y = best_loc
         w, h = best_size
+        if best_conf >= 0.98:
+            self._last_hits[template_name] = (screenshot.shape, (x, y, w, h))
         return DetectionResult(
             found=True,
             confidence=best_conf,

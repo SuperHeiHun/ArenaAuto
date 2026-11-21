@@ -21,6 +21,12 @@ ocr:
   power_allowlist: "0123456789,."
   challenge_allowlist: "0123456789/"
 
+battle:
+  result_scene_probe: true  # 自动模式：每场一次大范围变化稳定后的提前 OCR；false 保持原限频规则
+
+logging:
+  performance: false       # true：状态/等待/截图/OCR/模板耗时写入性能日志
+
 # Defaults include Chinese + Korean UI text; a Korean-capable OCR model is still
 # required to read Hangul. Existing per-user overrides are not merged silently.
 profile:

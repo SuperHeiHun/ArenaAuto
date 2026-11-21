@@ -62,10 +62,12 @@ class AutoTargeting:
         self.last_image: Optional[np.ndarray] = None
         self.last_reason = ""
         self.last_input = "原始截图"
+        self.frame_cache = None
 
     def _boxes(self, image: np.ndarray) -> List[OCRBox]:
         try:
-            result = recognize_frame(self.ocr, image, self.config.ocr)
+            result = (self.frame_cache.recognize(image, self.config.ocr) if self.frame_cache is not None
+                      else recognize_frame(self.ocr, image, self.config.ocr))
             self.last_input = result.input_mode
             return [b for b in result.boxes
                     if b.confidence >= self.config.calibration.min_ocr_confidence and b.text.strip()]

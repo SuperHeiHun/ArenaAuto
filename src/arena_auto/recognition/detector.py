@@ -87,6 +87,7 @@ class ScreenDetector:
         self._frame_boxes_ref: Optional[np.ndarray] = None
         self._frame_boxes: List[OCRBox] = []
         self._last_template_kind: Optional[ScreenKind] = None
+        self.frame_cache = None
 
     def invalidate_frame_cache(self) -> None:
         self._frame_boxes_ref = None
@@ -100,7 +101,9 @@ class ScreenDetector:
             return self._frame_boxes
         started = time.perf_counter()
         try:
-            if self.engine is not None:
+            if self.frame_cache is not None:
+                boxes = self.frame_cache.raw(screenshot)
+            elif self.engine is not None:
                 boxes = self.engine.recognize(screenshot)
             else:
                 boxes = self.ocr.recognize(screenshot)

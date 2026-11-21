@@ -40,6 +40,7 @@ from arena_auto.recognition.detector import (
 )
 from arena_auto.recognition.ocr import OCRProvider, create_ocr_provider
 from arena_auto.recognition.auto_targeting import AutoTargeting
+from arena_auto.recognition.scene_change import SettledSceneChange
 from arena_auto.recognition.ocr_engine import OcrEngine
 from arena_auto.recognition.screen import CoordinateScaler, crop_region
 from arena_auto.recognition.template import TemplateRecognizer
@@ -66,6 +67,7 @@ class ControllerCallbacks:
 @dataclass
 class _RuntimeContext:
     screenshot: Optional[np.ndarray] = None
+    screenshot_at: float = 0.0
     screen: ScreenKind = ScreenKind.UNKNOWN
     opponents: List[Opponent] = field(default_factory=list)
     target: Optional[Opponent] = None
@@ -83,6 +85,10 @@ class _RuntimeContext:
     auto_selection_attempts: int = 0
     auto_config_saved: bool = False
     result_ocr_last_at: float = 0.0
+    layout_frame: Optional[np.ndarray] = None
+    layout_frame_at: float = 0.0
+    arena_frame: Optional[np.ndarray] = None
+    result_scene_change: SettledSceneChange = field(default_factory=SettledSceneChange)
 
 
 class AutomationController:
@@ -118,6 +124,7 @@ class AutomationController:
         )
         self.buttons = ButtonFinder(self.templates, self.ocr, self.config, self.debug)
         self.auto_targeting = AutoTargeting(self.ocr, self.config)
+        self._attach_frame_cache()
         self._ocr_signature = OcrEngine.shared_provider_key(self.config.ocr)
 
         self.sm = StateMachine(
@@ -132,6 +139,14 @@ class AutomationController:
         self._historical = self._load_historical()
 
     # ------------------------------------------------------------------ public
+    def _attach_frame_cache(self) -> None:
+        from arena_auto.recognition.ocr_pipeline import FrameOCRCache
+
+        self.frame_cache = FrameOCRCache(self.ocr)
+        # Manual ROI mode retains its original page recognition path.
+        self.detector.frame_cache = self.frame_cache if self.config.automation.auto_targeting else None
+        self.auto_targeting.frame_cache = self.frame_cache
+
     @property
     def is_running(self) -> bool:
         return self._running
@@ -192,6 +207,9 @@ class AutomationController:
         self.challenge_reader.config = self.config
         self.buttons.config = self.config
         self.auto_targeting.config = self.config
+        self._attach_frame_cache()
+        self.ctx.layout_frame = None
+        self.ctx.arena_frame = None
         try:
             from arena_auto.recognition.ocr_engine import set_performance_logging
 
@@ -338,7 +356,12 @@ class AutomationController:
         """Interruptible sleep. Returns True if stop was requested."""
         if seconds <= 0:
             return self.stop_event.is_set()
-        return self.stop_event.wait(seconds)
+        started = time.perf_counter()
+        stopped = self.stop_event.wait(seconds)
+        from arena_auto.recognition.ocr_engine import perf_log
+
+        perf_log("Interruptible wait", (time.perf_counter() - started) * 1000.0)
+        return stopped
 
     def _safe_tap(self, x: int, y: int, label: str = "") -> None:
         if self.stop_event.is_set():
@@ -347,11 +370,19 @@ class AutomationController:
             self._log("INFO", f"[DRY RUN] tap({x},{y}) {label}".rstrip())
             return
         delay = self.config.automation.click_delay
+        self.frame_cache.clear()
+        self.detector.invalidate_frame_cache()
+        self.ctx.layout_frame = None
+        self.ctx.arena_frame = None
         self._log("INFO", f"点击 ({x},{y}) {label}".rstrip())
         self.adb.tap(x, y, delay=delay)
 
     def _shot(self) -> np.ndarray:
         started = time.perf_counter()
+        captured_at = time.monotonic()
+        self.frame_cache.clear()
+        self.ctx.layout_frame = None
+        self.ctx.arena_frame = None
         image = self.adb.screenshot()
         elapsed = (time.perf_counter() - started) * 1000.0
         try:
@@ -362,6 +393,7 @@ class AutomationController:
             pass
         self.scaler.maybe_update_from_image(image)
         self.ctx.screenshot = image
+        self.ctx.screenshot_at = captured_at
         self._emit_screenshot(image)
         return image
 
@@ -392,7 +424,13 @@ class AutomationController:
             logger.error("未知状态: %s", state)
             self.sm.transition(AutomationState.RECOVERY)
             return
-        handler()
+        started = time.perf_counter()
+        try:
+            handler()
+        finally:
+            from arena_auto.recognition.ocr_engine import perf_log
+
+            perf_log(f"State {state.name}", (time.perf_counter() - started) * 1000.0)
 
     # ------------------------------------------------------------------ states
     def _state_check_device(self) -> None:
@@ -423,6 +461,8 @@ class AutomationController:
         self.debug.save(image, category=kind.value if kind != ScreenKind.UNKNOWN else "debug")
 
         if kind == ScreenKind.ARENA:
+            if self.config.automation.auto_targeting:
+                self.ctx.arena_frame = image
             self.sm.transition(AutomationState.ARENA)
         elif kind == ScreenKind.PREPARE:
             self.sm.transition(AutomationState.PREPARE)
@@ -441,7 +481,10 @@ class AutomationController:
             self.sm.transition(AutomationState.RECOVERY)
 
     def _state_arena(self) -> None:
-        image = self._shot()
+        image = self.ctx.arena_frame
+        self.ctx.arena_frame = None
+        if image is None or time.monotonic() - self.ctx.screenshot_at > 1.0:
+            image = self._shot()
         # 1) challenge count
         challenge = self._read_challenge(image)
         if challenge is None:
@@ -450,6 +493,9 @@ class AutomationController:
             self.sm.transition(AutomationState.STOPPED if self.config.automation.auto_targeting else AutomationState.RECOVERY)
             return
         self.ctx.challenge = challenge
+        if self.config.automation.auto_targeting:
+            self.ctx.layout_frame = image
+            self.ctx.layout_frame_at = self.ctx.screenshot_at
         if self.callbacks.on_challenge:
             try:
                 self.callbacks.on_challenge(challenge)
@@ -500,7 +546,23 @@ class AutomationController:
         try:
             if automatic:
                 self._log("INFO", "自动初始化：共用半自动配置 OCR（原图优先，空结果预处理重试），战力仍多帧复核")
-                opponents, selected = self.auto_targeting.select(factory, threshold, self.stop_event)
+                layout_frame = self.ctx.layout_frame
+                self.ctx.layout_frame = None
+                # Only discovery may reuse the immediately preceding arena
+                # frame. All numeric reads and pre-tap validation stay fresh.
+                if time.monotonic() - self.ctx.layout_frame_at > 1.0:
+                    layout_frame = None
+
+                def selection_factory():
+                    nonlocal layout_frame
+                    if self.stop_event.is_set():
+                        raise StoppedError("用户停止")
+                    if layout_frame is not None:
+                        image, layout_frame = layout_frame, None
+                        return image
+                    return factory()
+
+                opponents, selected = self.auto_targeting.select(selection_factory, threshold, self.stop_event)
                 if self.auto_targeting.last_image is not None:
                     overlay = self.auto_targeting.draw(self.auto_targeting.last_image)
                     self.debug.save(overlay, category="arena", tag="auto_targeting")
@@ -712,6 +774,7 @@ class AutomationController:
             self._log("INFO", "检测到「去获胜」")
             self.ctx.auto_selection_attempts = 0
             self.ctx.result_ocr_last_at = 0.0
+            self.ctx.result_scene_change = SettledSceneChange()
             cx, cy = result.center
             self._safe_tap(cx, cy, label="去获胜")
             self.ctx.battle_started_at = time.monotonic()
@@ -750,6 +813,8 @@ class AutomationController:
             raise StoppedError("用户停止")
 
         # --- Template-only (priority: Victory, Defeat, then exit / go_win) ---
+        scene_changed = (self.ctx.result_scene_change.update(image)
+                         if self.config.automation.auto_targeting and battle_cfg.result_scene_probe else False)
         outcome = self.detector.outcome_from_templates(image)
         if outcome is not None:
             self.ctx.outcome = outcome
@@ -783,7 +848,7 @@ class AutomationController:
         if not automatic and not getattr(debug_cfg, "allow_ocr_fallback", False):
             return
         min_fails = max(1, int(getattr(debug_cfg, "ocr_fallback_min_failures", 3)))
-        if self.ctx.wait_result_template_fails < min_fails:
+        if self.ctx.wait_result_template_fails < min_fails and not scene_changed:
             return
         # "State looks abnormal": battle well past typical duration, or long miss streak.
         abnormal = (
@@ -793,7 +858,7 @@ class AutomationController:
         if not automatic and not abnormal:
             return
 
-        probe = self._probe_result_ocr(image)
+        probe = self._probe_result_ocr(image, scene_changed=scene_changed)
         if probe is None:
             return
         kind, ocr_outcome = probe
@@ -813,10 +878,15 @@ class AutomationController:
             self.sm.transition(AutomationState.PREPARE)
             return
 
-    def _probe_result_ocr(self, image: np.ndarray) -> Optional[Tuple[ScreenKind, Optional[str]]]:
+    def _probe_result_ocr(self, image: np.ndarray, *, scene_changed: bool = False) -> Optional[Tuple[ScreenKind, Optional[str]]]:
         """At most one OCR probe per cooldown; reuses boxes for live templates."""
         now = time.monotonic()
-        if self.ctx.result_ocr_last_at > 0 and now - self.ctx.result_ocr_last_at < self.config.battle.result_ocr_interval:
+        # A one-shot settled transition can shorten a long cooldown, but never
+        # starts probes less than five seconds apart or guesses a result.
+        cooldown = self.config.battle.result_ocr_interval
+        if scene_changed and self.config.automation.auto_targeting:
+            cooldown = 5.0
+        if self.ctx.result_ocr_last_at > 0 and now - self.ctx.result_ocr_last_at < cooldown:
             return None
         if self.stop_event.is_set():
             raise StoppedError("用户停止")

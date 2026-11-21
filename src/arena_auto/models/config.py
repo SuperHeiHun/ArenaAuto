@@ -93,6 +93,7 @@ class BattleSettings:
     poll_interval: float = 5.0
     max_duration: float = 300.0
     result_ocr_interval: float = 15.0  # Auto mode: cooldown after a result OCR probe.
+    result_scene_probe: bool = True  # One early OCR probe after a settled scene change.
 
 
 @dataclass

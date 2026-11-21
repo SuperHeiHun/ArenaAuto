@@ -23,6 +23,57 @@ class FrameOCRResult:
     input_mode: str = "原始截图"
 
 
+class FrameOCRCache:
+    """Share OCR only for the exact same immutable frame, never stable ROI reads.
+
+    Retains one frame. A fresh screenshot, config reload or device action clears
+    the evidence; pixel similarity is deliberately not used as a cache key.
+    """
+
+    def __init__(self, provider: OCRProvider) -> None:
+        self.provider = provider
+        self.clear()
+
+    def clear(self) -> None:
+        self._image = None
+        self._raw = None
+        self._result = None
+
+    def raw(self, image: np.ndarray) -> List[OCRBox]:
+        if image is not self._image:
+            self.clear()
+            self._image = image
+        if self._raw is None:
+            self._raw = list(self.provider.recognize(image))
+        return list(self._raw)
+
+    def recognize(self, image: np.ndarray, settings: OcrSettings) -> FrameOCRResult:
+        try:
+            boxes = self.raw(image)
+        except StoppedError:
+            raise
+        except Exception as exc:
+            logger.warning("[OCR] 原始截图识别失败: %s", exc)
+            self._image, self._raw = image, []
+            boxes = []
+        if boxes:
+            return FrameOCRResult(boxes)
+        if self._result is None:
+            # Retry preprocessing through the existing shared pipeline. The raw
+            # call is already cached; only the processed retry performs OCR.
+            cache = self
+
+            class CachedRaw:
+                def recognize(self, frame):
+                    return cache.raw(frame)
+
+            self._result = recognize_frame(CachedRaw(), image, settings)
+            # The retry changes the raw cache's frame. Restore the original
+            # frame and empty raw result so future consumers share the retry.
+            self._image, self._raw = image, boxes
+        return FrameOCRResult(list(self._result.boxes), self._result.input_mode)
+
+
 def recognize_frame(provider: OCRProvider, screenshot: np.ndarray,
                     settings: OcrSettings) -> FrameOCRResult:
     """Original image first, preprocessed retry only when empty or failed.
